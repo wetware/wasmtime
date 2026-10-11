@@ -511,14 +511,18 @@ mod lifecycle_tests {
         }))
     }
 
-    fn file(contents: &[u8]) -> File {
-        let mut file = tempfile::tempfile().unwrap();
+    fn file(contents: &[u8]) -> (tempfile::TempPath, File) {
+        // Named files permit the handle reopen used by append on Windows.
+        let (mut file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
         std::io::Write::write_all(&mut file, contents).unwrap();
-        File::new(
-            file,
-            FsPerms::ReadWrite,
-            OpenMode::READ | OpenMode::WRITE,
-            false,
+        (
+            path,
+            File::new(
+                file,
+                FsPerms::ReadWrite,
+                OpenMode::READ | OpenMode::WRITE,
+                false,
+            ),
         )
     }
 
@@ -543,7 +547,7 @@ mod lifecycle_tests {
     #[test]
     fn completed_unpolled_read_releases_operation() {
         for contents in [b"data".as_slice(), b"".as_slice()] {
-            let file = file(contents);
+            let (_path, file) = file(contents);
             let drops = Arc::new(AtomicUsize::new(0));
             let mut stream = FileInputStream::new_with_hook(&file, 0, hook(&drops));
             let owners = Arc::strong_count(&file.file);
@@ -571,7 +575,7 @@ mod lifecycle_tests {
     }
 
     fn check_completed_unpolled_write(append: bool) {
-        let file = file(b"head");
+        let (_path, file) = file(b"head");
         let drops = Arc::new(AtomicUsize::new(0));
         let mut stream = if append {
             FileOutputStream::append_with_hook(&file, hook(&drops))

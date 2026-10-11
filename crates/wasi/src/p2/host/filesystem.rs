@@ -821,20 +821,25 @@ mod test {
         }
     }
 
-    fn file_with_contents(contents: &[u8]) -> File {
-        let mut file = tempfile::tempfile().unwrap();
+    fn file_with_contents(contents: &[u8]) -> (tempfile::TempPath, File) {
+        // Named files permit the handle reopen used by append on Windows.
+        let (mut file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
         std::io::Write::write_all(&mut file, contents).unwrap();
-        File::new(
-            file,
-            FsPerms::ReadWrite,
-            OpenMode::READ | OpenMode::WRITE,
-            true,
+        (
+            path,
+            File::new(
+                file,
+                FsPerms::ReadWrite,
+                OpenMode::READ | OpenMode::WRITE,
+                true,
+            ),
         )
     }
 
     fn dir(path: &std::path::Path) -> Dir {
         Dir::new(
-            std::fs::File::open(path).unwrap(),
+            cap_primitives::fs::open_ambient_dir(path, cap_primitives::ambient_authority())
+                .unwrap(),
             FsPerms::ReadWrite,
             OpenMode::READ | OpenMode::WRITE,
             true,
@@ -870,10 +875,9 @@ mod test {
     async fn stat_rejection_is_would_block() {
         let mut ctx = WasiFilesystemCtx::default();
         ctx.set_operation_hook(|| Err(FilesystemOperationError::Rejected));
+        let (_path, file) = file_with_contents(b"contents");
         let mut table = ResourceTable::new();
-        let file = table
-            .push(Descriptor::File(file_with_contents(b"contents")))
-            .unwrap();
+        let file = table.push(Descriptor::File(file)).unwrap();
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,
             table: &mut table,
@@ -889,10 +893,9 @@ mod test {
     async fn is_same_object_rejection_is_a_typed_trap() {
         let mut ctx = WasiFilesystemCtx::default();
         ctx.set_operation_hook(|| Err(FilesystemOperationError::Rejected));
+        let (_path, file) = file_with_contents(b"contents");
         let mut table = ResourceTable::new();
-        let file = table
-            .push(Descriptor::File(file_with_contents(b"contents")))
-            .unwrap();
+        let file = table.push(Descriptor::File(file)).unwrap();
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,
             table: &mut table,
@@ -959,10 +962,9 @@ mod test {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut ctx = WasiFilesystemCtx::default();
         counting_hook(&mut ctx, admissions.clone(), drops.clone());
+        let (_path, file) = file_with_contents(b"ab");
         let mut table = ResourceTable::new();
-        let file = table
-            .push(Descriptor::File(file_with_contents(b"ab")))
-            .unwrap();
+        let file = table.push(Descriptor::File(file)).unwrap();
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,
             table: &mut table,
@@ -999,10 +1001,9 @@ mod test {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut ctx = WasiFilesystemCtx::default();
         counting_hook(&mut ctx, admissions.clone(), drops.clone());
+        let (_path, file) = file_with_contents(b"");
         let mut table = ResourceTable::new();
-        let file = table
-            .push(Descriptor::File(file_with_contents(b"")))
-            .unwrap();
+        let file = table.push(Descriptor::File(file)).unwrap();
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,
             table: &mut table,

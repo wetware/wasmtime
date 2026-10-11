@@ -1285,7 +1285,13 @@ mod tests {
         let _lock = TEST_LOCK.lock().await;
         let gate = InstalledGate::new(NativeWorkSite::ReadDirectory, 1);
         let directory = tempfile::tempdir().unwrap();
-        let dir = Arc::new(std::fs::File::open(directory.path()).unwrap());
+        let dir = Arc::new(
+            cap_primitives::fs::open_ambient_dir(
+                directory.path(),
+                cap_primitives::ambient_authority(),
+            )
+            .unwrap(),
+        );
         let count = Arc::new(AtomicUsize::new(0));
         let (dropped_tx, dropped_rx) = mpsc::channel();
         let operation = FilesystemOperation::new(CountDrop {
@@ -1362,7 +1368,11 @@ mod tests {
         let gate = InstalledGate::new_panicking(NativeWorkSite::ReadDirectory);
         let directory = tempfile::tempdir().unwrap();
         let descriptor = Descriptor::Dir(Dir::new(
-            std::fs::File::open(directory.path()).unwrap(),
+            cap_primitives::fs::open_ambient_dir(
+                directory.path(),
+                cap_primitives::ambient_authority(),
+            )
+            .unwrap(),
             FsPerms::ReadOnly,
             OpenMode::READ,
             true,

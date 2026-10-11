@@ -1461,7 +1461,11 @@ mod lifecycle_tests {
 
     fn dir(allow_blocking_current_thread: bool) -> (tempfile::TempDir, Dir) {
         let tempdir = tempfile::tempdir().unwrap();
-        let dir = std::fs::File::open(tempdir.path()).unwrap();
+        let dir = cap_primitives::fs::open_ambient_dir(
+            tempdir.path(),
+            cap_primitives::ambient_authority(),
+        )
+        .unwrap();
         (
             tempdir,
             Dir::new(
