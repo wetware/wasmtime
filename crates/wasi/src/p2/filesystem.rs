@@ -1,6 +1,8 @@
 use crate::TrappableError;
-use crate::filesystem::File;
 use crate::filesystem::sys;
+use crate::filesystem::{
+    File, FilesystemOperation, FilesystemOperationError, FilesystemOperationHook,
+};
 use crate::p2::bindings::filesystem::types;
 use crate::p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult};
 use crate::runtime::AbortOnDropJoinHandle;
@@ -17,6 +19,7 @@ impl From<crate::filesystem::ErrorCode> for types::ErrorCode {
     fn from(error: crate::filesystem::ErrorCode) -> Self {
         match error {
             crate::filesystem::ErrorCode::Access => Self::Access,
+            crate::filesystem::ErrorCode::WouldBlock => Self::WouldBlock,
             crate::filesystem::ErrorCode::Already => Self::Already,
             crate::filesystem::ErrorCode::BadDescriptor => Self::BadDescriptor,
             crate::filesystem::ErrorCode::Busy => Self::Busy,
@@ -51,6 +54,14 @@ impl From<crate::filesystem::ErrorCode> for FsError {
     }
 }
 
+impl From<FilesystemOperationError> for FsError {
+    fn from(error: FilesystemOperationError) -> Self {
+        match error {
+            FilesystemOperationError::Rejected => types::ErrorCode::WouldBlock.into(),
+        }
+    }
+}
+
 impl From<wasmtime::component::ResourceTableError> for FsError {
     fn from(error: wasmtime::component::ResourceTableError) -> Self {
         Self::trap(error)
@@ -67,12 +78,13 @@ pub struct FileInputStream {
     file: File,
     position: u64,
     state: ReadState,
+    operation_hook: Option<FilesystemOperationHook>,
 }
 enum ReadState {
     Idle,
     Waiting(AbortOnDropJoinHandle<ReadState>),
     DataAvailable(Bytes),
-    Error(io::Error),
+    Error(wasmtime::Error),
     Closed,
 }
 impl FileInputStream {
@@ -81,7 +93,22 @@ impl FileInputStream {
             file: file.clone(),
             position,
             state: ReadState::Idle,
+            operation_hook: None,
         }
+    }
+
+    pub(crate) fn new_with_hook(
+        file: &File,
+        position: u64,
+        operation_hook: Option<FilesystemOperationHook>,
+    ) -> Self {
+        let mut stream = Self::new(file, position);
+        stream.operation_hook = operation_hook;
+        stream
+    }
+
+    fn start_operation(&self) -> Result<Option<FilesystemOperation>, FilesystemOperationError> {
+        self.operation_hook.as_ref().map(|hook| hook()).transpose()
     }
 
     fn blocking_read(file: &std::fs::File, offset: u64, size: usize) -> ReadState {
@@ -96,7 +123,7 @@ impl FileInputStream {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                     // Try again, continue looping
                 }
-                Err(e) => return ReadState::Error(e),
+                Err(e) => return ReadState::Error(e.into()),
             }
         }
     }
@@ -121,9 +148,12 @@ impl InputStream for FileInputStream {
                 }
 
                 let p = self.position;
+                let operation = self
+                    .start_operation()
+                    .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
                 self.state = ReadState::Waiting(
                     self.file
-                        .spawn_blocking(move |f| Self::blocking_read(f, p, size)),
+                        .spawn_blocking(operation, move |f| Self::blocking_read(f, p, size)),
                 );
                 Ok(Bytes::new())
             }
@@ -138,7 +168,7 @@ impl InputStream for FileInputStream {
             }
             ReadState::Waiting(_) => Ok(Bytes::new()),
             ReadState::Error(_) => match mem::replace(&mut self.state, ReadState::Closed) {
-                ReadState::Error(e) => Err(StreamError::LastOperationFailed(e.into())),
+                ReadState::Error(e) => Err(StreamError::LastOperationFailed(e)),
                 _ => unreachable!(),
             },
             ReadState::Closed => Err(StreamError::Closed),
@@ -152,9 +182,12 @@ impl InputStream for FileInputStream {
         // Before we defer to the regular `read`, make sure it has data ready to go:
         if let ReadState::Idle = self.state {
             let p = self.position;
+            let operation = self
+                .start_operation()
+                .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
             self.state = self
                 .file
-                .run_blocking(move |f| Self::blocking_read(f, p, size))
+                .run_blocking(operation, move |f| Self::blocking_read(f, p, size))
                 .await;
         }
 
@@ -188,10 +221,16 @@ impl Pollable for FileInputStream {
 
             const DEFAULT_READ_SIZE: usize = 4096;
             let p = self.position;
-            self.state = ReadState::Waiting(
-                self.file
-                    .spawn_blocking(move |f| Self::blocking_read(f, p, DEFAULT_READ_SIZE)),
-            );
+            let operation = match self.start_operation() {
+                Ok(operation) => operation,
+                Err(error) => {
+                    self.state = ReadState::Error(error.into());
+                    return;
+                }
+            };
+            self.state = ReadState::Waiting(self.file.spawn_blocking(operation, move |f| {
+                Self::blocking_read(f, p, DEFAULT_READ_SIZE)
+            }));
         }
 
         self.wait_ready().await
@@ -208,6 +247,7 @@ pub(crate) struct FileOutputStream {
     file: File,
     mode: FileOutputMode,
     state: OutputState,
+    operation_hook: Option<FilesystemOperationHook>,
 }
 
 enum OutputState {
@@ -216,7 +256,7 @@ enum OutputState {
     /// no task is currently outstanding.
     Waiting(AbortOnDropJoinHandle<io::Result<usize>>),
     /// The last I/O operation failed with this error.
-    Error(io::Error),
+    Error(wasmtime::Error),
     Closed,
 }
 
@@ -226,7 +266,18 @@ impl FileOutputStream {
             file: file.clone(),
             mode: FileOutputMode::Position(position),
             state: OutputState::Ready,
+            operation_hook: None,
         }
+    }
+
+    pub(crate) fn write_at_with_hook(
+        file: &File,
+        position: u64,
+        operation_hook: Option<FilesystemOperationHook>,
+    ) -> Self {
+        let mut stream = Self::write_at(file, position);
+        stream.operation_hook = operation_hook;
+        stream
     }
 
     pub fn append(file: &File) -> Self {
@@ -234,7 +285,21 @@ impl FileOutputStream {
             file: file.clone(),
             mode: FileOutputMode::Append,
             state: OutputState::Ready,
+            operation_hook: None,
         }
+    }
+
+    pub(crate) fn append_with_hook(
+        file: &File,
+        operation_hook: Option<FilesystemOperationHook>,
+    ) -> Self {
+        let mut stream = Self::append(file);
+        stream.operation_hook = operation_hook;
+        stream
+    }
+
+    fn start_operation(&self) -> Result<Option<FilesystemOperation>, FilesystemOperationError> {
+        self.operation_hook.as_ref().map(|hook| hook()).transpose()
     }
 
     fn blocking_write(
@@ -291,9 +356,12 @@ impl OutputStream for FileOutputStream {
         }
 
         let m = self.mode;
+        let operation = self
+            .start_operation()
+            .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
         self.state = OutputState::Waiting(
             self.file
-                .spawn_blocking(move |f| Self::blocking_write(f, buf, m)),
+                .spawn_blocking(operation, move |f| Self::blocking_write(f, buf, m)),
         );
         Ok(())
     }
@@ -306,16 +374,19 @@ impl OutputStream for FileOutputStream {
             OutputState::Ready => {}
             OutputState::Closed => return Err(StreamError::Closed),
             OutputState::Error(_) => match mem::replace(&mut self.state, OutputState::Closed) {
-                OutputState::Error(e) => return Err(StreamError::LastOperationFailed(e.into())),
+                OutputState::Error(e) => return Err(StreamError::LastOperationFailed(e)),
                 _ => unreachable!(),
             },
             OutputState::Waiting(_) => unreachable!("we've just waited for readiness"),
         }
 
         let m = self.mode;
+        let operation = self
+            .start_operation()
+            .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
         match self
             .file
-            .run_blocking(move |f| Self::blocking_write(f, buf, m))
+            .run_blocking(operation, move |f| Self::blocking_write(f, buf, m))
             .await
         {
             Ok(nwritten) => {
@@ -339,7 +410,7 @@ impl OutputStream for FileOutputStream {
             OutputState::Ready | OutputState::Waiting(_) => Ok(()),
             OutputState::Closed => Err(StreamError::Closed),
             OutputState::Error(_) => match mem::replace(&mut self.state, OutputState::Closed) {
-                OutputState::Error(e) => Err(StreamError::LastOperationFailed(e.into())),
+                OutputState::Error(e) => Err(StreamError::LastOperationFailed(e)),
                 _ => unreachable!(),
             },
         }
@@ -349,7 +420,7 @@ impl OutputStream for FileOutputStream {
             OutputState::Ready => Ok(FILE_WRITE_CAPACITY),
             OutputState::Closed => Err(StreamError::Closed),
             OutputState::Error(_) => match mem::replace(&mut self.state, OutputState::Closed) {
-                OutputState::Error(e) => Err(StreamError::LastOperationFailed(e.into())),
+                OutputState::Error(e) => Err(StreamError::LastOperationFailed(e)),
                 _ => unreachable!(),
             },
             OutputState::Waiting(_) => Ok(0),
@@ -386,7 +457,7 @@ impl Pollable for FileOutputStream {
                     }
                     OutputState::Ready
                 }
-                Err(e) => OutputState::Error(e),
+                Err(e) => OutputState::Error(e.into()),
             };
         }
     }
@@ -413,5 +484,139 @@ impl IntoIterator for ReaddirIterator {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_inner().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::filesystem::{FsPerms, OpenMode};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CountDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn hook(drops: &Arc<AtomicUsize>) -> Option<FilesystemOperationHook> {
+        let drops = drops.clone();
+        Some(Arc::new(move || {
+            Ok(FilesystemOperation::new(CountDrop(drops.clone())))
+        }))
+    }
+
+    fn file(contents: &[u8]) -> (tempfile::TempPath, File) {
+        // Named files permit the handle reopen used by append on Windows.
+        let (mut file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+        std::io::Write::write_all(&mut file, contents).unwrap();
+        (
+            path,
+            File::new(
+                file,
+                FsPerms::ReadWrite,
+                OpenMode::READ | OpenMode::WRITE,
+                false,
+            ),
+        )
+    }
+
+    fn finish_native_work_without_polling(
+        runtime: tokio::runtime::Runtime,
+        file: &File,
+        owners: usize,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Arc::strong_count(&file.file) != owners {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native work did not finish"
+            );
+            std::thread::yield_now();
+        }
+        // The worker has disposed its file clone. Shutdown now waits for the
+        // worker to return without cancelling a task that has not started.
+        drop(runtime);
+    }
+
+    #[test]
+    fn completed_unpolled_read_releases_operation() {
+        for contents in [b"data".as_slice(), b"".as_slice()] {
+            let (_path, file) = file(contents);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut stream = FileInputStream::new_with_hook(&file, 0, hook(&drops));
+            let owners = Arc::strong_count(&file.file);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            {
+                let _entered = runtime.enter();
+                assert!(stream.read(4).unwrap().is_empty());
+            }
+
+            finish_native_work_without_polling(runtime, &file, owners);
+            assert!(matches!(stream.state, ReadState::Waiting(_)));
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+            crate::runtime::in_tokio(stream.ready());
+            if contents.is_empty() {
+                assert!(matches!(stream.read(4), Err(StreamError::Closed)));
+            } else {
+                assert_eq!(stream.read(4).unwrap().as_ref(), contents);
+            }
+            drop(stream);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    fn check_completed_unpolled_write(append: bool) {
+        let (_path, file) = file(b"head");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut stream = if append {
+            FileOutputStream::append_with_hook(&file, hook(&drops))
+        } else {
+            FileOutputStream::write_at_with_hook(&file, 0, hook(&drops))
+        };
+        let owners = Arc::strong_count(&file.file);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        {
+            let _entered = runtime.enter();
+            assert!(stream.check_write().unwrap() >= 4);
+            stream.write(Bytes::from_static(b"data")).unwrap();
+        }
+
+        finish_native_work_without_polling(runtime, &file, owners);
+        assert!(matches!(stream.state, OutputState::Waiting(_)));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        crate::runtime::in_tokio(stream.ready());
+        assert!(stream.check_write().unwrap() >= 4);
+        let mut contents = [0; 8];
+        let n = sys::read_at_cursor_unspecified(&file.file, &mut contents, 0).unwrap();
+        let expected = if append {
+            b"headdata".as_slice()
+        } else {
+            b"data".as_slice()
+        };
+        assert_eq!(&contents[..n], expected);
+        drop(stream);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn completed_unpolled_write_releases_operation() {
+        check_completed_unpolled_write(false);
+    }
+
+    #[test]
+    fn completed_unpolled_append_releases_operation() {
+        check_completed_unpolled_write(true);
     }
 }

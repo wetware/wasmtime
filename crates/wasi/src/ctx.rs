@@ -1,6 +1,6 @@
 use crate::cli::{StdinStream, StdoutStream, WasiCliCtx};
 use crate::clocks::{HostMonotonicClock, HostWallClock, WasiClocksCtx};
-use crate::filesystem::{Dir, WasiFilesystemCtx};
+use crate::filesystem::{Dir, FilesystemOperation, FilesystemOperationError, WasiFilesystemCtx};
 use crate::random::WasiRandomCtx;
 use crate::sockets::{SocketAddrCheck, SocketAddrUse, WasiSocketsCtx};
 use crate::{FsPerms, OpenMode};
@@ -161,6 +161,60 @@ impl WasiCtxBuilder {
     /// support is disabled.
     pub fn allow_blocking_current_thread(&mut self, enable: bool) -> &mut Self {
         self.filesystem.allow_blocking_current_thread = enable;
+        self
+    }
+
+    /// Configures a hook which admits native filesystem operations.
+    ///
+    /// The returned [`FilesystemOperation`] is kept alive until all native
+    /// work started by that operation has finished. Returning
+    /// [`FilesystemOperationError::Rejected`] rejects the operation.
+    ///
+    /// The hook is synchronous and must return promptly without blocking. The
+    /// operation value only needs to be [`Send`]; its destructor may run on a
+    /// filesystem worker thread.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::cell::Cell;
+    /// use std::sync::{
+    ///     Arc,
+    ///     atomic::{AtomicUsize, Ordering},
+    /// };
+    /// use wasmtime_wasi::WasiCtxBuilder;
+    /// use wasmtime_wasi::filesystem::FilesystemOperation;
+    ///
+    /// struct Lease {
+    ///     active: Arc<AtomicUsize>,
+    ///     // `Cell` makes this value `Send` but not `Sync`.
+    ///     _not_sync: Cell<()>,
+    /// }
+    ///
+    /// impl Drop for Lease {
+    ///     fn drop(&mut self) {
+    ///         self.active.fetch_sub(1, Ordering::Relaxed);
+    ///     }
+    /// }
+    ///
+    /// let active = Arc::new(AtomicUsize::new(0));
+    /// let mut builder = WasiCtxBuilder::new();
+    /// builder.filesystem_operation_hook({
+    ///     let active = active.clone();
+    ///     move || {
+    ///         active.fetch_add(1, Ordering::Relaxed);
+    ///         Ok(FilesystemOperation::new(Lease {
+    ///             active: active.clone(),
+    ///             _not_sync: Cell::new(()),
+    ///         }))
+    ///     }
+    /// });
+    /// ```
+    pub fn filesystem_operation_hook<F>(&mut self, hook: F) -> &mut Self
+    where
+        F: Fn() -> Result<FilesystemOperation, FilesystemOperationError> + Send + Sync + 'static,
+    {
+        self.filesystem.set_operation_hook(hook);
         self
     }
 

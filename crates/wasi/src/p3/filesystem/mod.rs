@@ -1,4 +1,6 @@
 mod host;
+#[cfg(test)]
+mod lifecycle_tests;
 
 use crate::TrappableError;
 use crate::filesystem::{WasiFilesystem, WasiFilesystemView};
@@ -114,6 +116,7 @@ impl From<crate::filesystem::ErrorCode> for types::ErrorCode {
             crate::filesystem::ErrorCode::NotPermitted => Self::NotPermitted,
             crate::filesystem::ErrorCode::Pipe => Self::Pipe,
             crate::filesystem::ErrorCode::InvalidSeek => Self::InvalidSeek,
+            crate::filesystem::ErrorCode::WouldBlock => Self::Busy,
         }
     }
 }

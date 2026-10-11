@@ -30,131 +30,30 @@ impl types::Host for WasiFilesystemCtxView<'_> {
     ) -> wasmtime::Result<Option<ErrorCode>> {
         let err = self.table.get(&err)?;
 
-        // Currently `err` always comes from the stream implementation which
-        // uses standard reads/writes so only check for `std::io::Error` here.
+        // Stream errors retain either the native I/O error or the typed
+        // admission rejection that prevented the native operation.
         if let Some(err) = err.downcast_ref::<std::io::Error>() {
             return Ok(Some(ErrorCode::from(err)));
+        }
+        if err
+            .downcast_ref::<crate::filesystem::FilesystemOperationError>()
+            .is_some()
+        {
+            return Ok(Some(ErrorCode::WouldBlock));
         }
 
         Ok(None)
     }
 }
 
-impl HostDescriptor for WasiFilesystemCtxView<'_> {
-    async fn advise(
+impl WasiFilesystemCtxView<'_> {
+    // P1 shares one admission across enumeration and its follow-up metadata calls.
+    pub(crate) async fn read_directory_with_operation(
         &mut self,
         fd: Resource<types::Descriptor>,
-        offset: types::Filesize,
-        len: types::Filesize,
-        advice: types::Advice,
-    ) -> FsResult<()> {
-        let f = self.table.get(&fd)?.file()?;
-        f.advise(offset, len, advice.into()).await?;
-        Ok(())
-    }
-
-    async fn sync_data(&mut self, fd: Resource<types::Descriptor>) -> FsResult<()> {
-        let descriptor = self.table.get(&fd)?;
-        descriptor.sync_data().await?;
-        Ok(())
-    }
-
-    async fn get_flags(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-    ) -> FsResult<types::DescriptorFlags> {
-        let descriptor = self.table.get(&fd)?;
-        let flags = descriptor.get_flags().await?;
-        Ok(flags.into())
-    }
-
-    async fn get_type(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-    ) -> FsResult<types::DescriptorType> {
-        let descriptor = self.table.get(&fd)?;
-        let ty = descriptor.get_type().await?;
-        Ok(ty.into())
-    }
-
-    async fn set_size(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        size: types::Filesize,
-    ) -> FsResult<()> {
-        let f = self.table.get(&fd)?.file()?;
-        f.set_size(size).await?;
-        Ok(())
-    }
-
-    async fn set_times(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        atim: types::NewTimestamp,
-        mtim: types::NewTimestamp,
-    ) -> FsResult<()> {
-        let descriptor = self.table.get(&fd)?;
-        let atim = systemtimespec_from(atim)?;
-        let mtim = systemtimespec_from(mtim)?;
-        descriptor.set_times(atim, mtim).await?;
-        Ok(())
-    }
-
-    async fn read(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        len: types::Filesize,
-        offset: types::Filesize,
-    ) -> FsResult<(Vec<u8>, bool)> {
-        let f = self.table.get(&fd)?.file()?;
-
-        let (mut buffer, r) = f
-            .run_blocking(move |f| {
-                let mut buffer = vec![
-                    0;
-                    len.try_into()
-                        .unwrap_or(usize::MAX)
-                        .min(crate::MAX_READ_SIZE_ALLOC)
-                ];
-                let r = sys::read_at_cursor_unspecified(f, &mut buffer, offset);
-                (buffer, r)
-            })
-            .await;
-
-        let (bytes_read, state) = match r? {
-            0 => (0, true),
-            n => (n, false),
-        };
-
-        buffer.truncate(bytes_read);
-
-        Ok((buffer, state))
-    }
-
-    async fn write(
-        &mut self,
-        fd: Resource<types::Descriptor>,
-        buf: Vec<u8>,
-        offset: types::Filesize,
-    ) -> FsResult<types::Filesize> {
-        let f = self.table.get(&fd)?.file()?;
-        if f.perms.write_not_permitted() {
-            return Err(ErrorCode::NotPermitted.into());
-        }
-
-        let bytes_written = f
-            .run_blocking(move |f| sys::write_at_cursor_unspecified(f, &buf, offset))
-            .await?;
-
-        Ok(types::Filesize::try_from(bytes_written).expect("usize fits in Filesize"))
-    }
-
-    async fn read_directory(
-        &mut self,
-        fd: Resource<types::Descriptor>,
+        operation: Option<crate::filesystem::FilesystemOperation>,
     ) -> FsResult<Resource<types::DirectoryEntryStream>> {
         let d = self.table.get(&fd)?.dir()?;
-
         enum ReaddirError {
             Io(std::io::Error),
             IllegalSequence,
@@ -166,7 +65,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         }
 
         let entries = d
-            .run_blocking(|d| {
+            .run_blocking(operation, |d| {
                 // Both `entries` and `metadata` perform syscalls, which is why they are done
                 // within this `block` call, rather than delay calculating the metadata
                 // for entries when they're demanded later in the iterator chain.
@@ -209,10 +108,140 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         });
         Ok(self.table.push(ReaddirIterator::new(entries))?)
     }
+}
+
+impl HostDescriptor for WasiFilesystemCtxView<'_> {
+    async fn advise(
+        &mut self,
+        fd: Resource<types::Descriptor>,
+        offset: types::Filesize,
+        len: types::Filesize,
+        advice: types::Advice,
+    ) -> FsResult<()> {
+        let f = self.table.get(&fd)?.file()?;
+        let operation = self.ctx.start_operation()?;
+        f.advise(operation, offset, len, advice.into()).await?;
+        Ok(())
+    }
+
+    async fn sync_data(&mut self, fd: Resource<types::Descriptor>) -> FsResult<()> {
+        let descriptor = self.table.get(&fd)?;
+        let operation = self.ctx.start_operation()?;
+        descriptor.sync_data(operation).await?;
+        Ok(())
+    }
+
+    async fn get_flags(
+        &mut self,
+        fd: Resource<types::Descriptor>,
+    ) -> FsResult<types::DescriptorFlags> {
+        let descriptor = self.table.get(&fd)?;
+        let operation = self.ctx.start_operation()?;
+        let flags = descriptor.get_flags(operation).await?;
+        Ok(flags.into())
+    }
+
+    async fn get_type(
+        &mut self,
+        fd: Resource<types::Descriptor>,
+    ) -> FsResult<types::DescriptorType> {
+        let descriptor = self.table.get(&fd)?;
+        let operation = self.ctx.start_operation()?;
+        let ty = descriptor.get_type(operation).await?;
+        Ok(ty.into())
+    }
+
+    async fn set_size(
+        &mut self,
+        fd: Resource<types::Descriptor>,
+        size: types::Filesize,
+    ) -> FsResult<()> {
+        let f = self.table.get(&fd)?.file()?;
+        let operation = self.ctx.start_operation()?;
+        f.set_size(operation, size).await?;
+        Ok(())
+    }
+
+    async fn set_times(
+        &mut self,
+        fd: Resource<types::Descriptor>,
+        atim: types::NewTimestamp,
+        mtim: types::NewTimestamp,
+    ) -> FsResult<()> {
+        let descriptor = self.table.get(&fd)?;
+        let atim = systemtimespec_from(atim)?;
+        let mtim = systemtimespec_from(mtim)?;
+        let operation = self.ctx.start_operation()?;
+        descriptor.set_times(operation, atim, mtim).await?;
+        Ok(())
+    }
+
+    async fn read(
+        &mut self,
+        fd: Resource<types::Descriptor>,
+        len: types::Filesize,
+        offset: types::Filesize,
+    ) -> FsResult<(Vec<u8>, bool)> {
+        let f = self.table.get(&fd)?.file()?;
+        let operation = self.ctx.start_operation()?;
+
+        let (mut buffer, r) = f
+            .run_blocking(operation, move |f| {
+                let mut buffer = vec![
+                    0;
+                    len.try_into()
+                        .unwrap_or(usize::MAX)
+                        .min(crate::MAX_READ_SIZE_ALLOC)
+                ];
+                let r = sys::read_at_cursor_unspecified(f, &mut buffer, offset);
+                (buffer, r)
+            })
+            .await;
+
+        let (bytes_read, state) = match r? {
+            0 => (0, true),
+            n => (n, false),
+        };
+
+        buffer.truncate(bytes_read);
+
+        Ok((buffer, state))
+    }
+
+    async fn write(
+        &mut self,
+        fd: Resource<types::Descriptor>,
+        buf: Vec<u8>,
+        offset: types::Filesize,
+    ) -> FsResult<types::Filesize> {
+        let f = self.table.get(&fd)?.file()?;
+        if f.perms.write_not_permitted() {
+            return Err(ErrorCode::NotPermitted.into());
+        }
+        let operation = self.ctx.start_operation()?;
+
+        let bytes_written = f
+            .run_blocking(operation, move |f| {
+                sys::write_at_cursor_unspecified(f, &buf, offset)
+            })
+            .await?;
+
+        Ok(types::Filesize::try_from(bytes_written).expect("usize fits in Filesize"))
+    }
+
+    async fn read_directory(
+        &mut self,
+        fd: Resource<types::Descriptor>,
+    ) -> FsResult<Resource<types::DirectoryEntryStream>> {
+        self.table.get(&fd)?.dir()?;
+        let operation = self.ctx.start_operation()?;
+        self.read_directory_with_operation(fd, operation).await
+    }
 
     async fn sync(&mut self, fd: Resource<types::Descriptor>) -> FsResult<()> {
         let descriptor = self.table.get(&fd)?;
-        descriptor.sync().await?;
+        let operation = self.ctx.start_operation()?;
+        descriptor.sync(operation).await?;
         Ok(())
     }
 
@@ -222,13 +251,15 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<()> {
         let d = self.table.get(&fd)?.dir()?;
-        d.create_directory_at(path).await?;
+        let operation = self.ctx.start_operation()?;
+        d.create_directory_at(operation, path).await?;
         Ok(())
     }
 
     async fn stat(&mut self, fd: Resource<types::Descriptor>) -> FsResult<types::DescriptorStat> {
         let descriptor = self.table.get(&fd)?;
-        let stat = descriptor.stat().await?;
+        let operation = self.ctx.start_operation()?;
+        let stat = descriptor.stat(operation).await?;
         Ok(stat.try_into()?)
     }
 
@@ -239,7 +270,8 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<types::DescriptorStat> {
         let d = self.table.get(&fd)?.dir()?;
-        let stat = d.stat_at(path_flags.into(), path).await?;
+        let operation = self.ctx.start_operation()?;
+        let stat = d.stat_at(operation, path_flags.into(), path).await?;
         Ok(stat.try_into()?)
     }
 
@@ -254,7 +286,9 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         let d = self.table.get(&fd)?.dir()?;
         let atim = systemtimespec_from(atim)?;
         let mtim = systemtimespec_from(mtim)?;
-        d.set_times_at(path_flags.into(), path, atim, mtim).await?;
+        let operation = self.ctx.start_operation()?;
+        d.set_times_at(operation, path_flags.into(), path, atim, mtim)
+            .await?;
         Ok(())
     }
 
@@ -269,8 +303,15 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
     ) -> FsResult<()> {
         let old_dir = self.table.get(&fd)?.dir()?;
         let new_dir = self.table.get(&new_descriptor)?.dir()?;
+        let operation = self.ctx.start_operation()?;
         old_dir
-            .link_at(old_path_flags.into(), old_path, new_dir, new_path)
+            .link_at(
+                operation,
+                old_path_flags.into(),
+                old_path,
+                new_dir,
+                new_path,
+            )
             .await?;
         Ok(())
     }
@@ -284,8 +325,10 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         flags: types::DescriptorFlags,
     ) -> FsResult<Resource<types::Descriptor>> {
         let d = self.table.get(&fd)?.dir()?;
+        let operation = self.ctx.start_operation()?;
         let fd = d
             .open_at(
+                operation.clone(),
                 path_flags.into(),
                 path,
                 oflags.into(),
@@ -314,7 +357,8 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<String> {
         let d = self.table.get(&fd)?.dir()?;
-        let path = d.readlink_at(path).await?;
+        let operation = self.ctx.start_operation()?;
+        let path = d.readlink_at(operation, path).await?;
         Ok(path)
     }
 
@@ -324,7 +368,8 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<()> {
         let d = self.table.get(&fd)?.dir()?;
-        d.remove_directory_at(path).await?;
+        let operation = self.ctx.start_operation()?;
+        d.remove_directory_at(operation, path).await?;
         Ok(())
     }
 
@@ -337,7 +382,10 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
     ) -> FsResult<()> {
         let old_dir = self.table.get(&fd)?.dir()?;
         let new_dir = self.table.get(&new_fd)?.dir()?;
-        old_dir.rename_at(old_path, new_dir, new_path).await?;
+        let operation = self.ctx.start_operation()?;
+        old_dir
+            .rename_at(operation, old_path, new_dir, new_path)
+            .await?;
         Ok(())
     }
 
@@ -348,7 +396,8 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         dest_path: String,
     ) -> FsResult<()> {
         let d = self.table.get(&fd)?.dir()?;
-        d.symlink_at(src_path, dest_path).await?;
+        let operation = self.ctx.start_operation()?;
+        d.symlink_at(operation, src_path, dest_path).await?;
         Ok(())
     }
 
@@ -358,7 +407,8 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<()> {
         let d = self.table.get(&fd)?.dir()?;
-        d.unlink_file_at(path).await?;
+        let operation = self.ctx.start_operation()?;
+        d.unlink_file_at(operation, path).await?;
         Ok(())
     }
 
@@ -373,9 +423,11 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
             Descriptor::File(f) => f,
             Descriptor::Dir(_) => return Err(ErrorCode::IsDirectory.into()),
         };
+        let operation_hook = self.ctx.operation_hook();
 
         // Create a stream view for it.
-        let reader: DynInputStream = Box::new(FileInputStream::new(f, offset));
+        let reader: DynInputStream =
+            Box::new(FileInputStream::new_with_hook(f, offset, operation_hook));
 
         // Insert the stream view into the table. Trap if the table is full.
         let index = self.table.push(reader)?;
@@ -394,9 +446,10 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         if f.perms.write_not_permitted() {
             Err(types::ErrorCode::NotPermitted)?;
         }
+        let operation_hook = self.ctx.operation_hook();
 
         // Create a stream view for it.
-        let writer = FileOutputStream::write_at(f, offset);
+        let writer = FileOutputStream::write_at_with_hook(f, offset, operation_hook);
         let writer: DynOutputStream = Box::new(writer);
 
         // Insert the stream view into the table. Trap if the table is full.
@@ -415,9 +468,10 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         if f.perms.write_not_permitted() {
             Err(types::ErrorCode::NotPermitted)?;
         }
+        let operation_hook = self.ctx.operation_hook();
 
         // Create a stream view for it.
-        let appender = FileOutputStream::append(f);
+        let appender = FileOutputStream::append_with_hook(f, operation_hook);
         let appender: DynOutputStream = Box::new(appender);
 
         // Insert the stream view into the table. Trap if the table is full.
@@ -433,14 +487,16 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
     ) -> wasmtime::Result<bool> {
         let descriptor_a = self.table.get(&a)?;
         let descriptor_b = self.table.get(&b)?;
-        descriptor_a.is_same_object(descriptor_b).await
+        let operation = self.ctx.start_operation().map_err(wasmtime::Error::new)?;
+        descriptor_a.is_same_object(operation, descriptor_b).await
     }
     async fn metadata_hash(
         &mut self,
         fd: Resource<types::Descriptor>,
     ) -> FsResult<types::MetadataHashValue> {
         let fd = self.table.get(&fd)?;
-        let meta = fd.metadata_hash().await?;
+        let operation = self.ctx.start_operation()?;
+        let meta = fd.metadata_hash(operation).await?;
         Ok(meta.into())
     }
     async fn metadata_hash_at(
@@ -450,7 +506,10 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<types::MetadataHashValue> {
         let d = self.table.get(&fd)?.dir()?;
-        let meta = d.metadata_hash_at(path_flags.into(), path).await?;
+        let operation = self.ctx.start_operation()?;
+        let meta = d
+            .metadata_hash_at(operation, path_flags.into(), path)
+            .await?;
         Ok(meta.into())
     }
 }
@@ -743,7 +802,64 @@ impl From<crate::clocks::DatetimeError> for ErrorCode {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::filesystem::{
+        Dir, File, FilesystemOperation, FilesystemOperationError, FsPerms, OpenMode,
+        WasiFilesystemCtx,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use wasmtime::component::ResourceTable;
+    use wasmtime_wasi_io::streams::StreamError;
+
+    struct CountDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn file_with_contents(contents: &[u8]) -> (tempfile::TempPath, File) {
+        // Named files permit the handle reopen used by append on Windows.
+        let (mut file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+        std::io::Write::write_all(&mut file, contents).unwrap();
+        (
+            path,
+            File::new(
+                file,
+                FsPerms::ReadWrite,
+                OpenMode::READ | OpenMode::WRITE,
+                true,
+            ),
+        )
+    }
+
+    fn dir(path: &std::path::Path) -> Dir {
+        Dir::new(
+            cap_primitives::fs::open_ambient_dir(path, cap_primitives::ambient_authority())
+                .unwrap(),
+            FsPerms::ReadWrite,
+            OpenMode::READ | OpenMode::WRITE,
+            true,
+        )
+    }
+
+    fn borrowed<T: 'static>(resource: &Resource<T>) -> Resource<T> {
+        Resource::new_borrow(resource.rep())
+    }
+
+    fn counting_hook(
+        ctx: &mut WasiFilesystemCtx,
+        admissions: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    ) {
+        ctx.set_operation_hook(move || {
+            admissions.fetch_add(1, Ordering::SeqCst);
+            Ok(FilesystemOperation::new(CountDrop(drops.clone())))
+        });
+    }
 
     #[test]
     fn table_readdir_works() {
@@ -753,5 +869,204 @@ mod test {
             .unwrap();
         let _ = table.get(&ix).unwrap();
         table.delete(ix).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stat_rejection_is_would_block() {
+        let mut ctx = WasiFilesystemCtx::default();
+        ctx.set_operation_hook(|| Err(FilesystemOperationError::Rejected));
+        let (_path, file) = file_with_contents(b"contents");
+        let mut table = ResourceTable::new();
+        let file = table.push(Descriptor::File(file)).unwrap();
+        let mut view = WasiFilesystemCtxView {
+            ctx: &mut ctx,
+            table: &mut table,
+        };
+
+        let err = HostDescriptor::stat(&mut view, borrowed(&file))
+            .await
+            .unwrap_err();
+        assert_eq!(err.downcast().unwrap(), ErrorCode::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn is_same_object_rejection_is_a_typed_trap() {
+        let mut ctx = WasiFilesystemCtx::default();
+        ctx.set_operation_hook(|| Err(FilesystemOperationError::Rejected));
+        let (_path, file) = file_with_contents(b"contents");
+        let mut table = ResourceTable::new();
+        let file = table.push(Descriptor::File(file)).unwrap();
+        let mut view = WasiFilesystemCtxView {
+            ctx: &mut ctx,
+            table: &mut table,
+        };
+
+        let err = HostDescriptor::is_same_object(&mut view, borrowed(&file), borrowed(&file))
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<FilesystemOperationError>()
+                .is_some_and(|err| matches!(err, FilesystemOperationError::Rejected))
+        );
+    }
+
+    #[tokio::test]
+    async fn rename_and_link_each_admit_exactly_once() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("source"), b"contents").unwrap();
+
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut ctx = WasiFilesystemCtx::default();
+        counting_hook(&mut ctx, admissions.clone(), drops.clone());
+        let mut table = ResourceTable::new();
+        let directory = table.push(Descriptor::Dir(dir(tempdir.path()))).unwrap();
+        let mut view = WasiFilesystemCtxView {
+            ctx: &mut ctx,
+            table: &mut table,
+        };
+
+        HostDescriptor::rename_at(
+            &mut view,
+            borrowed(&directory),
+            "source".into(),
+            borrowed(&directory),
+            "renamed".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        HostDescriptor::link_at(
+            &mut view,
+            borrowed(&directory),
+            types::PathFlags::empty(),
+            "renamed".into(),
+            borrowed(&directory),
+            "linked".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(tempdir.path().join("linked")).unwrap(),
+            b"contents"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_stream_admits_each_native_read_and_releases_at_eof() {
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut ctx = WasiFilesystemCtx::default();
+        counting_hook(&mut ctx, admissions.clone(), drops.clone());
+        let (_path, file) = file_with_contents(b"ab");
+        let mut table = ResourceTable::new();
+        let file = table.push(Descriptor::File(file)).unwrap();
+        let mut view = WasiFilesystemCtxView {
+            ctx: &mut ctx,
+            table: &mut table,
+        };
+
+        let stream = HostDescriptor::read_via_stream(&mut view, borrowed(&file), 0).unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        let reader = view.table.get_mut(&stream).unwrap();
+        assert_eq!(&reader.blocking_read(1).await.unwrap()[..], b"a");
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(&reader.blocking_read(1).await.unwrap()[..], b"b");
+        assert_eq!(admissions.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            reader.blocking_read(1).await,
+            Err(StreamError::Closed)
+        ));
+        assert_eq!(admissions.load(Ordering::SeqCst), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        assert!(matches!(
+            reader.blocking_read(1).await,
+            Err(StreamError::Closed)
+        ));
+        assert_eq!(admissions.load(Ordering::SeqCst), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn output_streams_admit_each_native_write() {
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut ctx = WasiFilesystemCtx::default();
+        counting_hook(&mut ctx, admissions.clone(), drops.clone());
+        let (_path, file) = file_with_contents(b"");
+        let mut table = ResourceTable::new();
+        let file = table.push(Descriptor::File(file)).unwrap();
+        let mut view = WasiFilesystemCtxView {
+            ctx: &mut ctx,
+            table: &mut table,
+        };
+
+        let writer = HostDescriptor::write_via_stream(&mut view, borrowed(&file), 0).unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        {
+            let writer = view.table.get_mut(&writer).unwrap();
+            writer
+                .blocking_write_and_flush(bytes::Bytes::from_static(b"a"))
+                .await
+                .unwrap();
+            writer
+                .blocking_write_and_flush(bytes::Bytes::from_static(b"b"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(admissions.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+
+        let appender = HostDescriptor::append_via_stream(&mut view, borrowed(&file)).unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        view.table
+            .get_mut(&appender)
+            .unwrap()
+            .blocking_write_and_flush(bytes::Bytes::from_static(b"c"))
+            .await
+            .unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn open_at_releases_operation_when_result_table_is_full() {
+        let tempdir = tempfile::tempdir().unwrap();
+        std::fs::write(tempdir.path().join("file"), b"contents").unwrap();
+
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut ctx = WasiFilesystemCtx::default();
+        counting_hook(&mut ctx, admissions.clone(), drops.clone());
+        let mut table = ResourceTable::new();
+        let directory = table.push(Descriptor::Dir(dir(tempdir.path()))).unwrap();
+        table.set_max_capacity(1);
+        let mut view = WasiFilesystemCtxView {
+            ctx: &mut ctx,
+            table: &mut table,
+        };
+
+        HostDescriptor::open_at(
+            &mut view,
+            borrowed(&directory),
+            types::PathFlags::empty(),
+            "file".into(),
+            types::OpenFlags::empty(),
+            types::DescriptorFlags::READ,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

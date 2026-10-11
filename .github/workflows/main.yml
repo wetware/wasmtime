@@ -8,6 +8,7 @@ on:
     branches:
     - main
     - 'release-*'
+    - 'ww/wasmtime-48.0.1'
 
   # This is the CI that runs for PRs-to-merge.
   merge_group:
@@ -695,6 +696,13 @@ jobs:
     - uses: actions/checkout@v6
       with:
         submodules: true
+    # Build cargo-fuzz with stable Rust; its locked dependencies use compiler
+    # internals that are incompatible with the pinned nightly.
+    - uses: ./.github/actions/install-rust
+    - uses: ./.github/actions/cargo-install
+      with:
+        crate: cargo-fuzz
+        version: 0.13.1
     - uses: ./.github/actions/install-rust
       with:
         # This is pinned to match the version of Rust used on OSS-Fuzz to build
@@ -734,10 +742,6 @@ jobs:
     #
     # Install the OCaml packages necessary for fuzz targets that use the
     # `wasm-spec-interpreter`.
-    - uses: ./.github/actions/cargo-install
-      with:
-        crate: cargo-fuzz
-        version: 0.13.1
     - uses: ./.github/actions/apt-get-install
       with:
         packages: ocaml-nox ocamlbuild ocaml-findlib libzarith-ocaml-dev
