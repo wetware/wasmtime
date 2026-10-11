@@ -1,10 +1,23 @@
 use crate::store::{Ctx, MyWasiCtx};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use test_programs_artifacts::*;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Result, error::Context as _, format_err};
+use wasmtime_wasi::filesystem::FilesystemOperation;
 use wasmtime_wasi::p3::bindings::Command;
 use wasmtime_wasi::{FsPerms, WasiCtxBuilder};
+
+struct CountOnDrop(Arc<AtomicUsize>);
+
+impl Drop for CountOnDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 async fn run(path: &str) -> Result<()> {
     run_allow_blocking_current_thread(path, false).await
@@ -78,6 +91,29 @@ async fn p3_filesystem_file_read_write() -> wasmtime::Result<()> {
 #[test_log::test(tokio::test(flavor = "multi_thread"))]
 async fn p3_filesystem_file_read_write_blocking() -> wasmtime::Result<()> {
     run_allow_blocking_current_thread(P3_FILESYSTEM_FILE_READ_WRITE_COMPONENT, true).await
+}
+
+#[test_log::test(tokio::test(flavor = "multi_thread"))]
+async fn p3_filesystem_operations_release_all_lifecycle_values() -> wasmtime::Result<()> {
+    let admitted = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let admitted_by_hook = admitted.clone();
+    let dropped_by_operation = dropped.clone();
+
+    run_with_builder(P3_FILESYSTEM_FILE_READ_WRITE_COMPONENT, false, |builder| {
+        builder.filesystem_operation_hook(move || {
+            admitted_by_hook.fetch_add(1, Ordering::SeqCst);
+            Ok(FilesystemOperation::new(CountOnDrop(
+                dropped_by_operation.clone(),
+            )))
+        });
+    })
+    .await?;
+
+    let admitted = admitted.load(Ordering::SeqCst);
+    assert!(admitted > 0, "P3 filesystem work did not invoke the hook");
+    assert_eq!(dropped.load(Ordering::SeqCst), admitted);
+    Ok(())
 }
 
 #[test_log::test(tokio::test(flavor = "multi_thread"))]

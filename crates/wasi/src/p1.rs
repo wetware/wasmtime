@@ -652,6 +652,7 @@ impl WasiP1Ctx {
                 let append = *append;
                 drop(t);
                 let f = self.table.get(&fd)?.file()?;
+                let operation = self.wasi.filesystem.start_operation()?;
 
                 let do_write = move |f: &std::fs::File, buf: &[u8]| match (append, write) {
                     // Note that this is implementing Linux semantics of
@@ -671,7 +672,8 @@ impl WasiP1Ctx {
                     // block.
                     None => {
                         let buf = memory.to_vec(buf)?;
-                        f.run_blocking(move |f| do_write(f, &buf)).await
+                        f.run_blocking(operation.clone(), move |f| do_write(f, &buf))
+                            .await
                     }
                 };
 
@@ -682,7 +684,13 @@ impl WasiP1Ctx {
                 // position is left unmodified.
                 if let FdWrite::AtCur = write {
                     if append {
-                        let len = self.filesystem().stat(fd).await?;
+                        // Appending needs a follow-up stat to update the P1
+                        // cursor. Both syscalls are one P1 operation and share
+                        // the admission acquired above.
+                        let len = f
+                            .run_blocking(operation, sys::stat)
+                            .await
+                            .map_err(crate::filesystem::ErrorCode::from)?;
                         position.store(len.size, Ordering::Relaxed);
                     } else {
                         let pos = pos
@@ -907,10 +915,13 @@ impl From<StreamError> for types::Error {
             StreamError::Closed => types::Errno::Io.into(),
             StreamError::LastOperationFailed(e) => match e.downcast::<std::io::Error>() {
                 Ok(err) => filesystem::ErrorCode::from(err).into(),
-                Err(e) => {
-                    tracing::debug!("dropping error {e:?}");
-                    types::Errno::Io.into()
-                }
+                Err(e) => match e.downcast::<crate::filesystem::FilesystemOperationError>() {
+                    Ok(err) => err.into(),
+                    Err(e) => {
+                        tracing::debug!("dropping error {e:?}");
+                        types::Errno::Io.into()
+                    }
+                },
             },
             StreamError::Trap(e) => types::Error::trap(e),
         }
@@ -1034,6 +1045,7 @@ impl From<crate::filesystem::ErrorCode> for types::Errno {
     fn from(code: crate::filesystem::ErrorCode) -> Self {
         match code {
             crate::filesystem::ErrorCode::Access => types::Errno::Acces,
+            crate::filesystem::ErrorCode::WouldBlock => types::Errno::Again,
             crate::filesystem::ErrorCode::Already => types::Errno::Already,
             crate::filesystem::ErrorCode::BadDescriptor => types::Errno::Badf,
             crate::filesystem::ErrorCode::Busy => types::Errno::Busy,
@@ -1103,6 +1115,12 @@ impl From<filesystem::ErrorCode> for types::Errno {
             filesystem::ErrorCode::TextFileBusy => types::Errno::Txtbsy,
             filesystem::ErrorCode::CrossDevice => types::Errno::Xdev,
         }
+    }
+}
+
+impl From<crate::filesystem::FilesystemOperationError> for types::Error {
+    fn from(_: crate::filesystem::FilesystemOperationError) -> Self {
+        types::Errno::Again.into()
     }
 }
 
@@ -1478,11 +1496,11 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                 ..
             }) => (fd.borrowed(), *blocking_mode, *append),
         };
-        let flags = self.filesystem().get_flags(fd.borrowed()).await?;
-        let fs_filetype = self
-            .filesystem()
-            .get_type(fd.borrowed())
-            .await?
+        let descriptor = self.table.get(&fd)?;
+        let operation = self.wasi.filesystem.start_operation()?;
+        let flags: filesystem::DescriptorFlags =
+            descriptor.get_flags(operation.clone()).await?.into();
+        let fs_filetype = filesystem::DescriptorType::from(descriptor.get_type(operation).await?)
             .try_into()
             .map_err(types::Error::trap)?;
         let mut fs_flags = types::Fdflags::empty();
@@ -1588,6 +1606,8 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             Descriptor::Directory { fd, .. } | Descriptor::File(File { fd, .. }) => {
                 let fd = fd.borrowed();
                 drop(t);
+                let descriptor = self.table.get(&fd)?;
+                let operation = self.wasi.filesystem.start_operation()?;
                 let filesystem::DescriptorStat {
                     type_,
                     link_count: nlink,
@@ -1595,8 +1615,12 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                     data_access_timestamp,
                     data_modification_timestamp,
                     status_change_timestamp,
-                } = self.filesystem().stat(fd.borrowed()).await?;
-                let metadata_hash = self.filesystem().metadata_hash(fd).await?;
+                } = descriptor
+                    .stat(operation.clone())
+                    .await?
+                    .try_into()
+                    .map_err(FsError::from)?;
+                let metadata_hash = descriptor.metadata_hash(operation).await?;
                 let filetype = type_.try_into().map_err(types::Error::trap)?;
                 let zero = wall_clock::Datetime {
                     seconds: 0,
@@ -1686,11 +1710,13 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                 drop(t);
                 let pos = position.load(Ordering::Relaxed);
                 let file = self.table.get(&fd)?.file()?;
+                let operation = self.wasi.filesystem.start_operation()?;
                 let bytes_read = match (file.as_blocking_file(), memory.as_slice_mut(iov)?) {
                     // Try to read directly into wasm memory where possible
                     // when the current thread can block and additionally wasm
                     // memory isn't shared.
                     (Some(file), Some(mut buf)) => {
+                        let _operation = operation;
                         sys::read_at_cursor_unspecified(file, &mut buf, pos)
                             .map_err(|e| StreamError::LastOperationFailed(e.into()))?
                     }
@@ -1701,7 +1727,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                         drop(buf);
                         let mut buf = vec![0; iov.len() as usize];
                         let buf = file
-                            .run_blocking(move |file| -> Result<_, types::Error> {
+                            .run_blocking(operation, move |file| -> Result<_, types::Error> {
                                 let bytes_read =
                                     sys::read_at_cursor_unspecified(file, &mut buf, pos)
                                         .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
@@ -1955,8 +1981,14 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         cookie: types::Dircookie,
     ) -> Result<types::Size, types::Error> {
         let fd = self.get_dir_fd(fd)?;
-        let stream = self.filesystem().read_directory(fd.borrowed()).await?;
-        let dir_metadata_hash = self.filesystem().metadata_hash(fd.borrowed()).await?;
+        let operation = self.wasi.filesystem.start_operation()?;
+        let stream = self
+            .filesystem()
+            .read_directory_with_operation(fd.borrowed(), operation.clone())
+            .await?;
+        let descriptor = self.table.get(&fd)?.clone();
+        let d = descriptor.dir()?;
+        let dir_metadata_hash = descriptor.metadata_hash(operation.clone()).await?;
         let cookie = cookie.try_into().map_err(|_| types::Errno::Overflow)?;
 
         let head = [
@@ -1989,9 +2021,12 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             .zip(3u64..)
         {
             let filesystem::DirectoryEntry { type_, name } = entry?;
-            let metadata_hash = self
-                .filesystem()
-                .metadata_hash_at(fd.borrowed(), filesystem::PathFlags::empty(), name.clone())
+            let metadata_hash = d
+                .metadata_hash_at(
+                    operation.clone(),
+                    crate::filesystem::PathFlags::empty(),
+                    name.clone(),
+                )
                 .await?;
             let d_type = type_.try_into().map_err(types::Error::trap)?;
             let d_namlen: u32 = name.len().try_into().map_err(|_| types::Errno::Overflow)?;
@@ -2071,6 +2106,9 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
     ) -> Result<types::Filestat, types::Error> {
         let dirfd = self.get_dir_fd(dirfd)?;
         let path = self.read_string(memory, path)?;
+        let d = self.table.get(&dirfd)?.dir()?;
+        let operation = self.wasi.filesystem.start_operation()?;
+        let path_flags = filesystem::PathFlags::from(flags).into();
         let filesystem::DescriptorStat {
             type_,
             link_count: nlink,
@@ -2078,14 +2116,12 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             data_access_timestamp,
             data_modification_timestamp,
             status_change_timestamp,
-        } = self
-            .filesystem()
-            .stat_at(dirfd.borrowed(), flags.into(), path.clone())
-            .await?;
-        let metadata_hash = self
-            .filesystem()
-            .metadata_hash_at(dirfd, flags.into(), path)
-            .await?;
+        } = d
+            .stat_at(operation.clone(), path_flags, path.clone())
+            .await?
+            .try_into()
+            .map_err(FsError::from)?;
+        let metadata_hash = d.metadata_hash_at(operation, path_flags, path).await?;
         let filetype = type_.try_into().map_err(types::Error::trap)?;
         let zero = wall_clock::Datetime {
             seconds: 0,
@@ -2706,5 +2742,120 @@ trait ResourceExt<T> {
 impl<T: 'static> ResourceExt<T> for Resource<T> {
     fn borrowed(&self) -> Resource<T> {
         Resource::new_borrow(self.rep())
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::wasi_snapshot_preview1::WasiSnapshotPreview1;
+    use super::*;
+    use crate::filesystem::{FilesystemOperation, FilesystemOperationError};
+    use std::sync::atomic::AtomicUsize;
+
+    struct CountDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn composite_calls_share_one_admission() -> wasmtime::Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("file"), b"data")?;
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut builder = crate::WasiCtxBuilder::new();
+        builder.preopened_dir(directory.path(), ".", crate::FsPerms::ReadWrite)?;
+        builder.filesystem_operation_hook({
+            let admissions = admissions.clone();
+            let drops = drops.clone();
+            move || {
+                admissions.fetch_add(1, Ordering::SeqCst);
+                Ok(FilesystemOperation::new(CountDrop(drops.clone())))
+            }
+        });
+        let mut ctx = builder.build_p1();
+        ctx.table.set_max_capacity(1000);
+        ctx.hostcall_fuel = usize::MAX;
+        let mut bytes = vec![0; 4096];
+        bytes[..4].copy_from_slice(b"file");
+        let mut memory = GuestMemory::Unshared(&mut bytes);
+        let path = GuestPtr::<str>::new((0, 4));
+        let fd = ctx
+            .path_open(
+                &mut memory,
+                3.into(),
+                types::Lookupflags::empty(),
+                path,
+                types::Oflags::empty(),
+                types::Rights::FD_READ,
+                types::Rights::empty(),
+                types::Fdflags::empty(),
+            )
+            .await?;
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        ctx.fd_fdstat_get(&mut memory, fd).await?;
+        assert_eq!(admissions.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        ctx.fd_filestat_get(&mut memory, fd).await?;
+        assert_eq!(admissions.load(Ordering::SeqCst), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        ctx.path_filestat_get(&mut memory, 3.into(), types::Lookupflags::empty(), path)
+            .await?;
+        assert_eq!(admissions.load(Ordering::SeqCst), 4);
+        assert_eq!(drops.load(Ordering::SeqCst), 4);
+        ctx.fd_readdir(&mut memory, 3.into(), GuestPtr::new(8), 4088, 0)
+            .await?;
+        assert_eq!(admissions.load(Ordering::SeqCst), 5);
+        assert_eq!(drops.load(Ordering::SeqCst), 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fd_pread_rejection_is_again() -> wasmtime::Result<()> {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("file"), b"data")?;
+        let mut builder = crate::WasiCtxBuilder::new();
+        builder.preopened_dir(directory.path(), ".", crate::FsPerms::ReadWrite)?;
+        let mut ctx = builder.build_p1();
+        ctx.table.set_max_capacity(1000);
+        ctx.hostcall_fuel = usize::MAX;
+        let mut bytes = vec![0; 64];
+        bytes[..4].copy_from_slice(b"file");
+        let mut memory = GuestMemory::Unshared(&mut bytes);
+        let fd = ctx
+            .path_open(
+                &mut memory,
+                3.into(),
+                types::Lookupflags::empty(),
+                GuestPtr::<str>::new((0, 4)),
+                types::Oflags::empty(),
+                types::Rights::FD_READ,
+                types::Rights::empty(),
+                types::Fdflags::empty(),
+            )
+            .await?;
+
+        ctx.wasi
+            .filesystem
+            .set_operation_hook(|| Err(FilesystemOperationError::Rejected));
+        let iov = GuestPtr::<types::Iovec>::new(8);
+        memory.write(
+            iov,
+            types::Iovec {
+                buf: GuestPtr::new(16),
+                buf_len: 1,
+            },
+        )?;
+        let err = ctx
+            .fd_pread(&mut memory, fd, iov.as_array(1), 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.downcast()?, types::Errno::Again);
+        Ok(())
     }
 }

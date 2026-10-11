@@ -1,9 +1,11 @@
 use crate::TrappableError;
-use crate::filesystem::File;
+use crate::filesystem::FilesystemOperationJoinHandle;
 use crate::filesystem::sys;
+use crate::filesystem::{
+    File, FilesystemOperation, FilesystemOperationError, FilesystemOperationHook,
+};
 use crate::p2::bindings::filesystem::types;
 use crate::p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult};
-use crate::runtime::AbortOnDropJoinHandle;
 use bytes::{Bytes, BytesMut};
 use std::io;
 use std::mem;
@@ -17,6 +19,7 @@ impl From<crate::filesystem::ErrorCode> for types::ErrorCode {
     fn from(error: crate::filesystem::ErrorCode) -> Self {
         match error {
             crate::filesystem::ErrorCode::Access => Self::Access,
+            crate::filesystem::ErrorCode::WouldBlock => Self::WouldBlock,
             crate::filesystem::ErrorCode::Already => Self::Already,
             crate::filesystem::ErrorCode::BadDescriptor => Self::BadDescriptor,
             crate::filesystem::ErrorCode::Busy => Self::Busy,
@@ -51,6 +54,14 @@ impl From<crate::filesystem::ErrorCode> for FsError {
     }
 }
 
+impl From<FilesystemOperationError> for FsError {
+    fn from(error: FilesystemOperationError) -> Self {
+        match error {
+            FilesystemOperationError::Rejected => types::ErrorCode::WouldBlock.into(),
+        }
+    }
+}
+
 impl From<wasmtime::component::ResourceTableError> for FsError {
     fn from(error: wasmtime::component::ResourceTableError) -> Self {
         Self::trap(error)
@@ -67,12 +78,13 @@ pub struct FileInputStream {
     file: File,
     position: u64,
     state: ReadState,
+    operation_hook: Option<FilesystemOperationHook>,
 }
 enum ReadState {
     Idle,
-    Waiting(AbortOnDropJoinHandle<ReadState>),
+    Waiting(FilesystemOperationJoinHandle<ReadState>),
     DataAvailable(Bytes),
-    Error(io::Error),
+    Error(wasmtime::Error),
     Closed,
 }
 impl FileInputStream {
@@ -81,7 +93,22 @@ impl FileInputStream {
             file: file.clone(),
             position,
             state: ReadState::Idle,
+            operation_hook: None,
         }
+    }
+
+    pub(crate) fn new_with_hook(
+        file: &File,
+        position: u64,
+        operation_hook: Option<FilesystemOperationHook>,
+    ) -> Self {
+        let mut stream = Self::new(file, position);
+        stream.operation_hook = operation_hook;
+        stream
+    }
+
+    fn start_operation(&self) -> Result<Option<FilesystemOperation>, FilesystemOperationError> {
+        self.operation_hook.as_ref().map(|hook| hook()).transpose()
     }
 
     fn blocking_read(file: &std::fs::File, offset: u64, size: usize) -> ReadState {
@@ -96,7 +123,7 @@ impl FileInputStream {
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
                     // Try again, continue looping
                 }
-                Err(e) => return ReadState::Error(e),
+                Err(e) => return ReadState::Error(e.into()),
             }
         }
     }
@@ -121,9 +148,12 @@ impl InputStream for FileInputStream {
                 }
 
                 let p = self.position;
+                let operation = self
+                    .start_operation()
+                    .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
                 self.state = ReadState::Waiting(
                     self.file
-                        .spawn_blocking(move |f| Self::blocking_read(f, p, size)),
+                        .spawn_blocking(operation, move |f| Self::blocking_read(f, p, size)),
                 );
                 Ok(Bytes::new())
             }
@@ -138,7 +168,7 @@ impl InputStream for FileInputStream {
             }
             ReadState::Waiting(_) => Ok(Bytes::new()),
             ReadState::Error(_) => match mem::replace(&mut self.state, ReadState::Closed) {
-                ReadState::Error(e) => Err(StreamError::LastOperationFailed(e.into())),
+                ReadState::Error(e) => Err(StreamError::LastOperationFailed(e)),
                 _ => unreachable!(),
             },
             ReadState::Closed => Err(StreamError::Closed),
@@ -152,9 +182,12 @@ impl InputStream for FileInputStream {
         // Before we defer to the regular `read`, make sure it has data ready to go:
         if let ReadState::Idle = self.state {
             let p = self.position;
+            let operation = self
+                .start_operation()
+                .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
             self.state = self
                 .file
-                .run_blocking(move |f| Self::blocking_read(f, p, size))
+                .run_blocking(operation, move |f| Self::blocking_read(f, p, size))
                 .await;
         }
 
@@ -188,10 +221,16 @@ impl Pollable for FileInputStream {
 
             const DEFAULT_READ_SIZE: usize = 4096;
             let p = self.position;
-            self.state = ReadState::Waiting(
-                self.file
-                    .spawn_blocking(move |f| Self::blocking_read(f, p, DEFAULT_READ_SIZE)),
-            );
+            let operation = match self.start_operation() {
+                Ok(operation) => operation,
+                Err(error) => {
+                    self.state = ReadState::Error(error.into());
+                    return;
+                }
+            };
+            self.state = ReadState::Waiting(self.file.spawn_blocking(operation, move |f| {
+                Self::blocking_read(f, p, DEFAULT_READ_SIZE)
+            }));
         }
 
         self.wait_ready().await
@@ -208,15 +247,16 @@ pub(crate) struct FileOutputStream {
     file: File,
     mode: FileOutputMode,
     state: OutputState,
+    operation_hook: Option<FilesystemOperationHook>,
 }
 
 enum OutputState {
     Ready,
     /// Allows join future to be awaited in a cancellable manner. Gone variant indicates
     /// no task is currently outstanding.
-    Waiting(AbortOnDropJoinHandle<io::Result<usize>>),
+    Waiting(FilesystemOperationJoinHandle<io::Result<usize>>),
     /// The last I/O operation failed with this error.
-    Error(io::Error),
+    Error(wasmtime::Error),
     Closed,
 }
 
@@ -226,7 +266,18 @@ impl FileOutputStream {
             file: file.clone(),
             mode: FileOutputMode::Position(position),
             state: OutputState::Ready,
+            operation_hook: None,
         }
+    }
+
+    pub(crate) fn write_at_with_hook(
+        file: &File,
+        position: u64,
+        operation_hook: Option<FilesystemOperationHook>,
+    ) -> Self {
+        let mut stream = Self::write_at(file, position);
+        stream.operation_hook = operation_hook;
+        stream
     }
 
     pub fn append(file: &File) -> Self {
@@ -234,7 +285,21 @@ impl FileOutputStream {
             file: file.clone(),
             mode: FileOutputMode::Append,
             state: OutputState::Ready,
+            operation_hook: None,
         }
+    }
+
+    pub(crate) fn append_with_hook(
+        file: &File,
+        operation_hook: Option<FilesystemOperationHook>,
+    ) -> Self {
+        let mut stream = Self::append(file);
+        stream.operation_hook = operation_hook;
+        stream
+    }
+
+    fn start_operation(&self) -> Result<Option<FilesystemOperation>, FilesystemOperationError> {
+        self.operation_hook.as_ref().map(|hook| hook()).transpose()
     }
 
     fn blocking_write(
@@ -291,9 +356,12 @@ impl OutputStream for FileOutputStream {
         }
 
         let m = self.mode;
+        let operation = self
+            .start_operation()
+            .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
         self.state = OutputState::Waiting(
             self.file
-                .spawn_blocking(move |f| Self::blocking_write(f, buf, m)),
+                .spawn_blocking(operation, move |f| Self::blocking_write(f, buf, m)),
         );
         Ok(())
     }
@@ -306,16 +374,19 @@ impl OutputStream for FileOutputStream {
             OutputState::Ready => {}
             OutputState::Closed => return Err(StreamError::Closed),
             OutputState::Error(_) => match mem::replace(&mut self.state, OutputState::Closed) {
-                OutputState::Error(e) => return Err(StreamError::LastOperationFailed(e.into())),
+                OutputState::Error(e) => return Err(StreamError::LastOperationFailed(e)),
                 _ => unreachable!(),
             },
             OutputState::Waiting(_) => unreachable!("we've just waited for readiness"),
         }
 
         let m = self.mode;
+        let operation = self
+            .start_operation()
+            .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
         match self
             .file
-            .run_blocking(move |f| Self::blocking_write(f, buf, m))
+            .run_blocking(operation, move |f| Self::blocking_write(f, buf, m))
             .await
         {
             Ok(nwritten) => {
@@ -339,7 +410,7 @@ impl OutputStream for FileOutputStream {
             OutputState::Ready | OutputState::Waiting(_) => Ok(()),
             OutputState::Closed => Err(StreamError::Closed),
             OutputState::Error(_) => match mem::replace(&mut self.state, OutputState::Closed) {
-                OutputState::Error(e) => Err(StreamError::LastOperationFailed(e.into())),
+                OutputState::Error(e) => Err(StreamError::LastOperationFailed(e)),
                 _ => unreachable!(),
             },
         }
@@ -349,7 +420,7 @@ impl OutputStream for FileOutputStream {
             OutputState::Ready => Ok(FILE_WRITE_CAPACITY),
             OutputState::Closed => Err(StreamError::Closed),
             OutputState::Error(_) => match mem::replace(&mut self.state, OutputState::Closed) {
-                OutputState::Error(e) => Err(StreamError::LastOperationFailed(e.into())),
+                OutputState::Error(e) => Err(StreamError::LastOperationFailed(e)),
                 _ => unreachable!(),
             },
             OutputState::Waiting(_) => Ok(0),
@@ -386,7 +457,7 @@ impl Pollable for FileOutputStream {
                     }
                     OutputState::Ready
                 }
-                Err(e) => OutputState::Error(e),
+                Err(e) => OutputState::Error(e.into()),
             };
         }
     }
