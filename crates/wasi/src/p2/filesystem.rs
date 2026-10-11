@@ -1,11 +1,11 @@
 use crate::TrappableError;
-use crate::filesystem::FilesystemOperationJoinHandle;
 use crate::filesystem::sys;
 use crate::filesystem::{
     File, FilesystemOperation, FilesystemOperationError, FilesystemOperationHook,
 };
 use crate::p2::bindings::filesystem::types;
 use crate::p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult};
+use crate::runtime::AbortOnDropJoinHandle;
 use bytes::{Bytes, BytesMut};
 use std::io;
 use std::mem;
@@ -82,7 +82,7 @@ pub struct FileInputStream {
 }
 enum ReadState {
     Idle,
-    Waiting(FilesystemOperationJoinHandle<ReadState>),
+    Waiting(AbortOnDropJoinHandle<ReadState>),
     DataAvailable(Bytes),
     Error(wasmtime::Error),
     Closed,
@@ -254,7 +254,7 @@ enum OutputState {
     Ready,
     /// Allows join future to be awaited in a cancellable manner. Gone variant indicates
     /// no task is currently outstanding.
-    Waiting(FilesystemOperationJoinHandle<io::Result<usize>>),
+    Waiting(AbortOnDropJoinHandle<io::Result<usize>>),
     /// The last I/O operation failed with this error.
     Error(wasmtime::Error),
     Closed,
@@ -484,5 +484,135 @@ impl IntoIterator for ReaddirIterator {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_inner().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::filesystem::{FsPerms, OpenMode};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CountDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn hook(drops: &Arc<AtomicUsize>) -> Option<FilesystemOperationHook> {
+        let drops = drops.clone();
+        Some(Arc::new(move || {
+            Ok(FilesystemOperation::new(CountDrop(drops.clone())))
+        }))
+    }
+
+    fn file(contents: &[u8]) -> File {
+        let mut file = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut file, contents).unwrap();
+        File::new(
+            file,
+            FsPerms::ReadWrite,
+            OpenMode::READ | OpenMode::WRITE,
+            false,
+        )
+    }
+
+    fn finish_native_work_without_polling(
+        runtime: tokio::runtime::Runtime,
+        file: &File,
+        owners: usize,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while Arc::strong_count(&file.file) != owners {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native work did not finish"
+            );
+            std::thread::yield_now();
+        }
+        // The worker has disposed its file clone. Shutdown now waits for the
+        // worker to return without cancelling a task that has not started.
+        drop(runtime);
+    }
+
+    #[test]
+    fn completed_unpolled_read_releases_operation() {
+        for contents in [b"data".as_slice(), b"".as_slice()] {
+            let file = file(contents);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut stream = FileInputStream::new_with_hook(&file, 0, hook(&drops));
+            let owners = Arc::strong_count(&file.file);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            {
+                let _entered = runtime.enter();
+                assert!(stream.read(4).unwrap().is_empty());
+            }
+
+            finish_native_work_without_polling(runtime, &file, owners);
+            assert!(matches!(stream.state, ReadState::Waiting(_)));
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+            crate::runtime::in_tokio(stream.ready());
+            if contents.is_empty() {
+                assert!(matches!(stream.read(4), Err(StreamError::Closed)));
+            } else {
+                assert_eq!(stream.read(4).unwrap().as_ref(), contents);
+            }
+            drop(stream);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    fn check_completed_unpolled_write(append: bool) {
+        let file = file(b"head");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut stream = if append {
+            FileOutputStream::append_with_hook(&file, hook(&drops))
+        } else {
+            FileOutputStream::write_at_with_hook(&file, 0, hook(&drops))
+        };
+        let owners = Arc::strong_count(&file.file);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        {
+            let _entered = runtime.enter();
+            assert!(stream.check_write().unwrap() >= 4);
+            stream.write(Bytes::from_static(b"data")).unwrap();
+        }
+
+        finish_native_work_without_polling(runtime, &file, owners);
+        assert!(matches!(stream.state, OutputState::Waiting(_)));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        crate::runtime::in_tokio(stream.ready());
+        assert!(stream.check_write().unwrap() >= 4);
+        let mut contents = [0; 8];
+        let n = sys::read_at_cursor_unspecified(&file.file, &mut contents, 0).unwrap();
+        let expected = if append {
+            b"headdata".as_slice()
+        } else {
+            b"data".as_slice()
+        };
+        assert_eq!(&contents[..n], expected);
+        drop(stream);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn completed_unpolled_write_releases_operation() {
+        check_completed_unpolled_write(false);
+    }
+
+    #[test]
+    fn completed_unpolled_append_releases_operation() {
+        check_completed_unpolled_write(true);
     }
 }

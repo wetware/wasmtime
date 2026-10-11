@@ -2,10 +2,7 @@ use crate::clocks::Datetime;
 use crate::runtime::{AbortOnDropJoinHandle, spawn_blocking};
 use cap_primitives::fs::{DirOptions, FollowSymlinks, Metadata, OpenOptions, SystemTimeSpec};
 use std::collections::hash_map;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::SystemTime;
 use tracing::debug;
 use wasmtime::component::{HasData, Resource, ResourceTable};
@@ -125,6 +122,8 @@ impl WasiFilesystemCtx {
     /// A stream session or undelivered native result can retain the value after
     /// native work returns. The value is released after the session observes
     /// completion or is dropped, and after undelivered results are disposed.
+    /// Completed P2 stream tasks waiting for the guest to poll readiness do
+    /// not retain the value.
     /// Existing P2 streams retain the hook configured when they were created;
     /// replacing this hook does not change those streams.
     ///
@@ -821,29 +820,6 @@ impl<T> Drop for FilesystemOperationResult<T> {
     }
 }
 
-pub(crate) struct FilesystemOperationJoinHandle<T>(
-    AbortOnDropJoinHandle<FilesystemOperationResult<T>>,
-);
-
-impl<T> FilesystemOperationJoinHandle<T> {
-    pub(crate) async fn cancel(self) -> Option<T> {
-        self.0
-            .cancel()
-            .await
-            .map(FilesystemOperationResult::into_inner)
-    }
-}
-
-impl<T> Future for FilesystemOperationJoinHandle<T> {
-    type Output = T;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0)
-            .poll(cx)
-            .map(FilesystemOperationResult::into_inner)
-    }
-}
-
 #[derive(Clone)]
 pub struct File {
     /// The operating system File this struct is mediating access to.
@@ -910,27 +886,38 @@ impl File {
                 drop(operation);
                 result
             }
-            None => self.spawn_blocking(operation, body).await,
+            None => {
+                let result_operation = operation.clone();
+                self.spawn_blocking(operation, move |file| {
+                    FilesystemOperationResult::new(body(file), result_operation)
+                })
+                .await
+                .into_inner()
+            }
         }
     }
 
+    /// Retains ownership through native work and file-clone cleanup. Results
+    /// do not retain ownership; use `run_blocking` for native-resource results
+    /// whose disposal must remain covered if the caller abandons them.
     pub(crate) fn spawn_blocking<F, R>(
         &self,
         operation: Option<FilesystemOperation>,
         body: F,
-    ) -> FilesystemOperationJoinHandle<R>
+    ) -> AbortOnDropJoinHandle<R>
     where
         F: FnOnce(&std::fs::File) -> R + Send + 'static,
         R: Send + 'static,
     {
         let f = self.file.clone();
-        FilesystemOperationJoinHandle(spawn_blocking(move || {
+        spawn_blocking(move || {
             let operation = operation;
             let f = f;
             let result = body(&f);
             drop(f);
-            FilesystemOperationResult::new(result, operation)
-        }))
+            drop(operation);
+            result
+        })
     }
 
     /// Returns `Some` when the current thread is allowed to block in filesystem
@@ -1046,14 +1033,15 @@ impl Dir {
             result
         } else {
             let d = self.dir.clone();
-            FilesystemOperationJoinHandle(spawn_blocking(move || {
+            spawn_blocking(move || {
                 let operation = operation;
                 let d = d;
                 let result = body(&d);
                 drop(d);
                 FilesystemOperationResult::new(result, operation)
-            }))
+            })
             .await
+            .into_inner()
         }
     }
 
@@ -1548,6 +1536,40 @@ mod lifecycle_tests {
 
         assert_eq!(result, 42);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_stream_task_keeps_operation_alive_until_native_work_exits() {
+        struct CheckFileClosedOnDrop {
+            file: std::sync::Weak<std::fs::File>,
+            dropped: mpsc::Sender<bool>,
+        }
+
+        impl Drop for CheckFileClosedOnDrop {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(self.file.upgrade().is_none());
+            }
+        }
+
+        let file = file(false);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let operation = FilesystemOperation::new(CheckFileClosedOnDrop {
+            file: Arc::downgrade(&file.file),
+            dropped: dropped_tx,
+        });
+        let task = file.spawn_blocking(Some(operation), move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv_timeout(TIMEOUT).unwrap();
+        drop(task);
+        drop(file);
+
+        assert!(dropped_rx.try_recv().is_err());
+        release_tx.send(()).unwrap();
+        assert!(dropped_rx.recv_timeout(TIMEOUT).unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
