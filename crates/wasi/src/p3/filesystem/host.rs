@@ -1,5 +1,8 @@
 use crate::filesystem::sys;
-use crate::filesystem::{Descriptor, Dir, File, WasiFilesystem, WasiFilesystemCtxView};
+use crate::filesystem::{
+    Descriptor, Dir, File, FilesystemHandle, FilesystemOperation, NativeOperation, WasiFilesystem,
+    WasiFilesystemCtxView,
+};
 use crate::p3::bindings::clocks::system_clock;
 use crate::p3::bindings::filesystem::types::{
     self, Advice, DescriptorFlags, DescriptorStat, DescriptorType, DirectoryEntry, ErrorCode,
@@ -92,11 +95,42 @@ fn systemtimespec_from(t: NewTimestamp) -> Result<Option<SystemTime>, ErrorCode>
     }
 }
 
+// The iterator may own native state even after its last poll. Drop it before
+// releasing the operation, including when a poll unwinds.
+struct OperationStreamProducer<P>(Option<NativeOperation<P>>);
+
+impl<D, P: StreamProducer<D> + Unpin> StreamProducer<D> for OperationStreamProducer<P> {
+    type Item = P::Item;
+    type Buffer = P::Buffer;
+
+    fn poll_produce<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        store: StoreContextMut<'a, D>,
+        dst: Destination<'a, Self::Item, Self::Buffer>,
+        finish: bool,
+    ) -> Poll<wasmtime::Result<StreamResult>> {
+        let this = self.get_mut();
+        let Some(mut producer) = this.0.take() else {
+            return Poll::Ready(Ok(StreamResult::Dropped));
+        };
+        let result = Pin::new(&mut producer.value).poll_produce(cx, store, dst, finish);
+        if !matches!(
+            result,
+            Poll::Ready(Ok(StreamResult::Dropped)) | Poll::Ready(Err(_))
+        ) {
+            this.0 = Some(producer);
+        }
+        result
+    }
+}
+
 struct ReadStreamProducer {
     file: File,
     offset: u64,
     result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
     task: Option<JoinHandle<std::io::Result<BytesMut>>>,
+    operation: Option<FilesystemOperation>,
 }
 
 impl Drop for ReadStreamProducer {
@@ -110,6 +144,7 @@ impl ReadStreamProducer {
         if let Some(tx) = self.result.take() {
             _ = tx.send(res);
         }
+        self.operation = None;
     }
 
     /// Update the internal `offset` field after reading `amt` bytes from the file.
@@ -169,10 +204,15 @@ impl<D> StreamProducer<D> for ReadStreamProducer {
             buf.resize(DEFAULT_BUFFER_CAPACITY, 0);
             let file = Arc::clone(me.file.as_file());
             let offset = me.offset;
+            let native = NativeOperation::new((file, buf), me.operation.clone());
             spawn_blocking(move || {
-                sys::read_at_cursor_unspecified(&file, &mut buf, offset).map(|n| {
-                    buf.truncate(n);
-                    buf
+                native.run(|(file, buf)| {
+                    #[cfg(test)]
+                    lifecycle_tests::native_work_gate(file);
+                    sys::read_at_cursor_unspecified(file, buf, offset).map(|n| {
+                        buf.truncate(n);
+                        mem::take(buf)
+                    })
                 })
             })
         });
@@ -255,21 +295,27 @@ struct ReadDirStream {
 
 impl ReadDirStream {
     fn new(
-        dir: Arc<std::fs::File>,
+        dir: Arc<FilesystemHandle>,
         result: oneshot::Sender<Result<(), ErrorCode>>,
+        operation: Option<FilesystemOperation>,
     ) -> ReadDirStream {
         let (tx, rx) = mpsc::channel(1);
+        let native = NativeOperation::new((dir, tx), operation);
         ReadDirStream {
             task: spawn_blocking(move || {
-                let entries = crate::filesystem::primitives::read_dir(&dir)?;
-                for entry in entries {
-                    if let Some(entry) = map_dir_entry(entry)? {
-                        if let Err(_) = tx.blocking_send(entry) {
-                            break;
+                native.run(|(dir, tx)| {
+                    #[cfg(test)]
+                    lifecycle_tests::native_work_gate(dir);
+                    let entries = crate::filesystem::primitives::read_dir(dir)?;
+                    for entry in entries {
+                        if let Some(entry) = map_dir_entry(entry)? {
+                            if let Err(_) = tx.blocking_send(entry) {
+                                break;
+                            }
                         }
                     }
-                }
-                Ok(())
+                    Ok(())
+                })
             }),
             rx,
             result: Some(result),
@@ -345,6 +391,7 @@ struct WriteStreamConsumer {
     result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
     buffer: BytesMut,
     task: Option<JoinHandle<std::io::Result<(BytesMut, usize)>>>,
+    operation: Option<FilesystemOperation>,
 }
 
 #[derive(Copy, Clone)]
@@ -358,6 +405,7 @@ impl WriteStreamConsumer {
         file: File,
         location: WriteLocation,
         result: oneshot::Sender<Result<(), ErrorCode>>,
+        operation: Option<FilesystemOperation>,
     ) -> Self {
         Self {
             file,
@@ -365,11 +413,13 @@ impl WriteStreamConsumer {
             result: Some(result),
             buffer: BytesMut::default(),
             task: None,
+            operation,
         }
     }
 
     fn close(&mut self, res: Result<(), ErrorCode>) {
         _ = self.result.take().unwrap().send(res);
+        self.operation = None;
     }
 
     /// Update the internal `offset` field after writing `amt` bytes from the file.
@@ -435,7 +485,14 @@ impl<D> StreamConsumer<D> for WriteStreamConsumer {
             let buf = mem::take(&mut me.buffer);
             let file = Arc::clone(me.file.as_file());
             let location = me.location;
-            spawn_blocking(move || location.write(&file, &buf).map(|n| (buf, n)))
+            let native = NativeOperation::new((file, buf), me.operation.clone());
+            spawn_blocking(move || {
+                native.run(|(file, buf)| {
+                    #[cfg(test)]
+                    lifecycle_tests::native_work_gate(file);
+                    location.write(file, buf).map(|n| (mem::take(buf), n))
+                })
+            })
         });
         let result = match Pin::new(&mut *task).poll(cx) {
             // If cancellation is requested, then flag that to Tokio. Note that
@@ -483,6 +540,34 @@ impl types::Host for WasiFilesystemCtxView<'_> {
     }
 }
 
+// A successfully installed status must be closed if the second half of a
+// stream factory fails: dropping a FutureReader alone does not close it.
+fn finish_stream_factory<T>(
+    mut store: impl AsContextMut,
+    mut status: FutureReader<Result<(), ErrorCode>>,
+    stream: wasmtime::Result<StreamReader<T>>,
+) -> wasmtime::Result<(StreamReader<T>, FutureReader<Result<(), ErrorCode>>)> {
+    match stream {
+        Ok(stream) => Ok((stream, status)),
+        Err(err) => {
+            status.close(&mut store)?;
+            Err(err)
+        }
+    }
+}
+
+fn finish_pipe_factory(
+    mut store: impl AsContextMut,
+    mut status: FutureReader<Result<(), ErrorCode>>,
+    pipe: wasmtime::Result<()>,
+) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
+    if let Err(err) = pipe {
+        status.close(&mut store)?;
+        return Err(err);
+    }
+    Ok(status)
+}
+
 fn read_via_stream(
     mut store: impl AsContextMut,
     fd: Descriptor,
@@ -490,29 +575,31 @@ fn read_via_stream(
 ) -> wasmtime::Result<(StreamReader<u8>, FutureReader<Result<(), ErrorCode>>)> {
     let mut store = store.as_context_mut();
     let file = match fd {
-        Descriptor::File(file) => file,
-        Descriptor::Dir(_) => {
-            return Ok((
-                StreamReader::new(&mut store, iter::empty())?,
-                FutureReader::new(&mut store, async move {
-                    wasmtime::error::Ok(Err(ErrorCode::IsDirectory))
-                })?,
-            ));
-        }
+        Descriptor::File(file) => file
+            .start_operation()
+            .map(|operation| (file, operation))
+            .map_err(FilesystemError::from),
+        Descriptor::Dir(_) => Err(ErrorCode::IsDirectory.into()),
     };
     let (result_tx, result_rx) = oneshot::channel();
-    Ok((
-        StreamReader::new(
+    let status = FutureReader::new(&mut store, result_rx)?;
+    let stream = match file {
+        Ok((file, operation)) => StreamReader::new(
             &mut store,
             ReadStreamProducer {
                 file,
                 offset,
                 result: Some(result_tx),
                 task: None,
+                operation,
             },
-        )?,
-        FutureReader::new(&mut store, result_rx)?,
-    ))
+        ),
+        Err(err) => {
+            let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
+            StreamReader::new(&mut store, iter::empty())
+        }
+    };
+    finish_stream_factory(&mut store, status, stream)
 }
 
 fn write_via_stream(
@@ -522,20 +609,33 @@ fn write_via_stream(
     location: WriteLocation,
 ) -> wasmtime::Result<FutureReader<Result<(), ErrorCode>>> {
     let mut store = store.as_context_mut();
+    let file = file.and_then(|file| {
+        let operation = file.start_operation()?;
+        Ok((file, operation))
+    });
     let (result_tx, result_rx) = oneshot::channel();
-    match file {
-        Ok(file) => {
-            data.pipe(
-                &mut store,
-                WriteStreamConsumer::new(file, location, result_tx),
-            )?;
-        }
+    let mut status = match FutureReader::new(&mut store, result_rx) {
+        Ok(status) => status,
         Err(err) => {
             data.close(&mut store)?;
-            let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
+            return Err(err);
         }
-    }
-    FutureReader::new(&mut store, result_rx)
+    };
+    let pipe = match file {
+        Ok((file, operation)) => data.pipe(
+            &mut store,
+            WriteStreamConsumer::new(file, location, result_tx, operation),
+        ),
+        Err(err) => {
+            if let Err(err) = data.close(&mut store) {
+                status.close(&mut store)?;
+                return Err(err);
+            }
+            let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
+            Ok(())
+        }
+    };
+    finish_pipe_factory(&mut store, status, pipe)
 }
 
 fn read_directory(
@@ -547,34 +647,47 @@ fn read_directory(
 )> {
     let mut store = store.as_context_mut();
     let (result_tx, result_rx) = oneshot::channel();
-    let stream = match dir {
-        Ok(dir) => {
-            let allow_blocking_current_thread = dir.allow_blocking_current_thread;
-            let dir = Arc::clone(dir.as_dir());
-            if allow_blocking_current_thread {
-                match crate::filesystem::primitives::read_dir(&dir) {
-                    Ok(readdir) => StreamReader::new(
-                        &mut store,
+    let dir = dir.and_then(|dir| {
+        let operation = dir.start_operation()?;
+        Ok((dir, operation))
+    });
+    // The synchronous iterator is constructed before installing concurrent
+    // state, so a native panic cannot strand a status future in the Store.
+    if let Ok((dir, operation)) = &dir {
+        if dir.allow_blocking_current_thread {
+            let entries = dir.as_dir().read_dir();
+            let status = FutureReader::new(&mut store, result_rx)?;
+            let stream = match entries {
+                Ok(entries) => StreamReader::new(
+                    &mut store,
+                    OperationStreamProducer(Some(NativeOperation::new(
                         FallibleIteratorProducer::new(
-                            readdir.filter_map(|e| map_dir_entry(e).transpose()),
+                            entries.filter_map(|e| map_dir_entry(e).transpose()),
                             result_tx,
                         ),
-                    )?,
-                    Err(e) => {
-                        let _ = result_tx.send(Err(e.into()));
-                        StreamReader::new(&mut store, iter::empty())?
-                    }
+                        operation.clone(),
+                    ))),
+                ),
+                Err(err) => {
+                    let _ = result_tx.send(Err(err.into()));
+                    StreamReader::new(&mut store, iter::empty())
                 }
-            } else {
-                StreamReader::new(&mut store, ReadDirStream::new(dir, result_tx))?
-            }
+            };
+            return finish_stream_factory(&mut store, status, stream);
         }
+    }
+    let status = FutureReader::new(&mut store, result_rx)?;
+    let stream = match dir {
+        Ok((dir, operation)) => StreamReader::new(
+            &mut store,
+            ReadDirStream::new(Arc::clone(dir.as_dir()), result_tx, operation),
+        ),
         Err(err) => {
             let _ = result_tx.send(Err(err.downcast().unwrap_or(ErrorCode::Io)));
-            StreamReader::new(&mut store, iter::empty())?
+            StreamReader::new(&mut store, iter::empty())
         }
     };
-    Ok((stream, FutureReader::new(&mut store, result_rx)?))
+    finish_stream_factory(&mut store, status, stream)
 }
 
 impl WasiFilesystemCtxView<'_> {
@@ -743,7 +856,8 @@ impl WasiFilesystemCtxView<'_> {
         path: String,
         open_flags: OpenFlags,
         flags: DescriptorFlags,
-    ) -> impl Future<Output = FilesystemResult<Descriptor>> + use<> {
+    ) -> impl Future<Output = FilesystemResult<crate::filesystem::NativeOperation<Descriptor>>> + use<>
+    {
         let dir = get_dir(self.table, fd).cloned();
         let allow_blocking_current_thread = self.ctx.allow_blocking_current_thread;
         async move {
@@ -1031,7 +1145,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         let fd = store
             .with(|mut s| s.get().open_at(&fd, path_flags, path, open_flags, flags))
             .await?;
-        let fd = store.with(|mut store| store.get().table.push(fd))?;
+        let fd = store.with(|mut store| fd.push(store.get().table))?;
         Ok(fd)
     }
 
@@ -1376,7 +1490,7 @@ mod named {
                 ctx.open_at(&fd, path_flags, path, open_flags, flags)
             });
             let fd = result.await?;
-            let fd = store.with(|mut store| store.get().0.filesystem(id).table.push(fd))?;
+            let fd = store.with(|mut store| fd.push(store.get().0.filesystem(id).table))?;
             Ok(fd)
         }
 
@@ -1509,3 +1623,7 @@ mod named {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_tests;
