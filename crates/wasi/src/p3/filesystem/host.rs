@@ -1,6 +1,6 @@
 use crate::filesystem::sys;
 use crate::filesystem::{
-    Descriptor, Dir, File, FilesystemOperation, FilesystemOperationError,
+    Descriptor, Dir, File, FilesystemHandle, FilesystemOperation, FilesystemOperationError,
     FilesystemOperationResult, WasiFilesystem, WasiFilesystemCtx, WasiFilesystemCtxView,
 };
 use crate::p3::bindings::clocks::system_clock;
@@ -374,7 +374,7 @@ struct ReadDirStream {
 
 impl ReadDirStream {
     fn new(
-        dir: Arc<std::fs::File>,
+        dir: Arc<FilesystemHandle>,
         result: oneshot::Sender<Result<(), ErrorCode>>,
         operation: Option<FilesystemOperation>,
     ) -> ReadDirStream {
@@ -942,7 +942,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
             super::lifecycle_tests::native_work_gate(
                 super::lifecycle_tests::NativeWorkSite::ReadDirectory,
             );
-            let readdir = match cap_primitives::fs::read_base_dir(&dir) {
+            let readdir = match dir.read_dir() {
                 Ok(readdir) => readdir,
                 Err(err) => {
                     let err = ErrorCode::from(err);
@@ -1248,6 +1248,91 @@ mod tests {
     }
 
     #[test]
+    fn terminal_read_releases_operation_but_retains_content() {
+        for overflow in [false, true] {
+            let content = Arc::new(AtomicUsize::new(0));
+            let operation = Arc::new(AtomicUsize::new(0));
+            let (content_tx, _content_rx) = mpsc::channel();
+            let (operation_tx, _operation_rx) = mpsc::channel();
+            let (result_tx, mut result_rx) = oneshot::channel();
+            let mut producer = ReadStreamProducer {
+                file: File::new(
+                    FilesystemHandle::new(
+                        tempfile::tempfile().unwrap(),
+                        CountDrop {
+                            count: content.clone(),
+                            dropped: content_tx,
+                        },
+                    ),
+                    FsPerms::ReadOnly,
+                    OpenMode::READ,
+                    false,
+                ),
+                offset: u64::MAX,
+                result: Some(result_tx),
+                operation: Some(FilesystemOperation::new(CountDrop {
+                    count: operation.clone(),
+                    dropped: operation_tx,
+                })),
+                task: None,
+            };
+
+            if overflow {
+                assert!(matches!(producer.complete_read(1), StreamResult::Dropped));
+                assert!(matches!(result_rx.try_recv(), Ok(Err(ErrorCode::Overflow))));
+            } else {
+                producer.close(Ok(()));
+                assert!(matches!(result_rx.try_recv(), Ok(Ok(()))));
+            }
+            assert_eq!(operation.load(Ordering::SeqCst), 1);
+            assert_eq!(content.load(Ordering::SeqCst), 0);
+            assert!(producer.file.file.metadata().is_ok());
+            drop(producer);
+            assert_eq!(content.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn terminal_write_and_append_release_operation_but_retain_content() {
+        for append in [false, true] {
+            let content = Arc::new(AtomicUsize::new(0));
+            let operation = Arc::new(AtomicUsize::new(0));
+            let (content_tx, _content_rx) = mpsc::channel();
+            let (operation_tx, _operation_rx) = mpsc::channel();
+            let (result_tx, mut result_rx) = oneshot::channel();
+            let file = File::new(
+                FilesystemHandle::new(
+                    tempfile::tempfile().unwrap(),
+                    CountDrop {
+                        count: content.clone(),
+                        dropped: content_tx,
+                    },
+                ),
+                FsPerms::ReadWrite,
+                OpenMode::WRITE,
+                false,
+            );
+            let operation_owner = Some(FilesystemOperation::new(CountDrop {
+                count: operation.clone(),
+                dropped: operation_tx,
+            }));
+            let mut consumer = if append {
+                WriteStreamConsumer::new_append(file, result_tx, operation_owner)
+            } else {
+                WriteStreamConsumer::new_at(file, 0, result_tx, operation_owner)
+            };
+
+            consumer.close(Ok(()));
+            assert!(matches!(result_rx.try_recv(), Ok(Ok(()))));
+            assert_eq!(operation.load(Ordering::SeqCst), 1);
+            assert_eq!(content.load(Ordering::SeqCst), 0);
+            assert!(consumer.file.file.metadata().is_ok());
+            drop(consumer);
+            assert_eq!(content.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
     fn terminal_overflow_releases_session_before_producer_drop() {
         let count = Arc::new(AtomicUsize::new(0));
         let (dropped_tx, dropped_rx) = mpsc::channel();
@@ -1285,13 +1370,13 @@ mod tests {
         let _lock = TEST_LOCK.lock().await;
         let gate = InstalledGate::new(NativeWorkSite::ReadDirectory, 1);
         let directory = tempfile::tempdir().unwrap();
-        let dir = Arc::new(
+        let dir = Arc::new(FilesystemHandle::from(
             cap_primitives::fs::open_ambient_dir(
                 directory.path(),
                 cap_primitives::ambient_authority(),
             )
             .unwrap(),
-        );
+        ));
         let count = Arc::new(AtomicUsize::new(0));
         let (dropped_tx, dropped_rx) = mpsc::channel();
         let operation = FilesystemOperation::new(CountDrop {

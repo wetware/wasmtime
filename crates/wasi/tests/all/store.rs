@@ -19,6 +19,10 @@ fn prepare_workspace(exe_name: &str) -> Result<TempDir> {
 }
 
 impl<T> Ctx<T> {
+    #[cfg_attr(
+        not(feature = "p3"),
+        expect(dead_code, reason = "this convenience constructor is used by P3 tests")
+    )]
     pub fn new(
         engine: &Engine,
         name: &str,
