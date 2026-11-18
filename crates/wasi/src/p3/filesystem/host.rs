@@ -1,7 +1,7 @@
 use crate::filesystem::sys;
 use crate::filesystem::{
-    Descriptor, Dir, File, FilesystemHandle, FilesystemOperation, FilesystemOperationError,
-    FilesystemOperationResult, WasiFilesystem, WasiFilesystemCtx, WasiFilesystemCtxView,
+    Descriptor, Dir, File, FilesystemOperation, NativeOperation, WasiFilesystem,
+    WasiFilesystemCtxView,
 };
 use crate::p3::bindings::clocks::system_clock;
 use crate::p3::bindings::filesystem::types::{
@@ -99,18 +99,6 @@ impl<T> AccessorExt for Accessor<T, WasiFilesystem> {
     }
 }
 
-fn start_operation(ctx: &WasiFilesystemCtx) -> Result<Option<FilesystemOperation>, ErrorCode> {
-    ctx.start_operation().map_err(|err| match err {
-        FilesystemOperationError::Rejected => ErrorCode::Busy,
-    })
-}
-
-fn start_accessor_operation<U>(
-    store: &Accessor<U, WasiFilesystem>,
-) -> FilesystemResult<Option<FilesystemOperation>> {
-    store.with(|mut store| start_operation(store.get().ctx).map_err(FilesystemError::from))
-}
-
 struct LifecycleStreamProducer<P> {
     producer: Option<P>,
     operation: Option<FilesystemOperation>,
@@ -190,7 +178,7 @@ struct ReadStreamProducer {
     offset: u64,
     result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
     operation: Option<FilesystemOperation>,
-    task: Option<JoinHandle<FilesystemOperationResult<std::io::Result<BytesMut>>>>,
+    task: Option<JoinHandle<std::io::Result<BytesMut>>>,
 }
 
 impl Drop for ReadStreamProducer {
@@ -276,20 +264,18 @@ impl<D> StreamProducer<D> for ReadStreamProducer {
             buf.resize(DEFAULT_BUFFER_CAPACITY, 0);
             let file = Arc::clone(me.file.as_file());
             let offset = me.offset;
-            let operation = me.operation.clone();
+            let native = NativeOperation::new((file, buf), me.operation.clone());
             spawn_blocking(move || {
-                let operation = operation;
-                let file = file;
-                #[cfg(test)]
-                super::lifecycle_tests::native_work_gate(
-                    super::lifecycle_tests::NativeWorkSite::Read,
-                );
-                let result = sys::read_at_cursor_unspecified(&file, &mut buf, offset).map(|n| {
-                    buf.truncate(n);
-                    buf
-                });
-                drop(file);
-                FilesystemOperationResult::new(result, operation)
+                native.run(|(file, buf)| {
+                    #[cfg(test)]
+                    super::lifecycle_tests::native_work_gate(
+                        super::lifecycle_tests::NativeWorkSite::Read,
+                    );
+                    sys::read_at_cursor_unspecified(file, buf, offset).map(|n| {
+                        buf.truncate(n);
+                        mem::take(buf)
+                    })
+                })
             })
         });
 
@@ -307,7 +293,7 @@ impl<D> StreamProducer<D> for ReadStreamProducer {
             other => ready!(other),
         };
         self.task = None;
-        match result.map(FilesystemOperationResult::into_inner) {
+        match result {
             Ok(Ok(buf)) if buf.is_empty() => {
                 self.close(Ok(()));
                 Poll::Ready(Ok(StreamResult::Dropped))
@@ -367,30 +353,26 @@ fn map_dir_entry(
 
 struct ReadDirStream {
     rx: mpsc::Receiver<DirectoryEntry>,
-    task: JoinHandle<FilesystemOperationResult<Result<(), ErrorCode>>>,
+    task: JoinHandle<Result<(), ErrorCode>>,
     result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
-    operation: Option<FilesystemOperation>,
 }
 
 impl ReadDirStream {
     fn new(
-        dir: Arc<FilesystemHandle>,
+        dir: Arc<std::fs::File>,
         result: oneshot::Sender<Result<(), ErrorCode>>,
         operation: Option<FilesystemOperation>,
     ) -> ReadDirStream {
         let (tx, rx) = mpsc::channel(1);
-        let native_operation = operation.clone();
+        let native = NativeOperation::new((dir, tx), operation);
         ReadDirStream {
             task: spawn_blocking(move || {
-                let operation = native_operation;
-                let dir = dir;
-                let tx = tx;
-                #[cfg(test)]
-                super::lifecycle_tests::native_work_gate(
-                    super::lifecycle_tests::NativeWorkSite::ReadDirectory,
-                );
-                let value = (|| {
-                    let entries = cap_primitives::fs::read_base_dir(&dir)?;
+                native.run(|(dir, tx)| {
+                    #[cfg(test)]
+                    super::lifecycle_tests::native_work_gate(
+                        super::lifecycle_tests::NativeWorkSite::ReadDirectory,
+                    );
+                    let entries = cap_primitives::fs::read_base_dir(dir)?;
                     for entry in entries {
                         if let Some(entry) = map_dir_entry(entry)? {
                             if let Err(_) = tx.blocking_send(entry) {
@@ -399,14 +381,10 @@ impl ReadDirStream {
                         }
                     }
                     Ok(())
-                })();
-                drop(tx);
-                drop(dir);
-                FilesystemOperationResult::new(value, operation)
+                })
             }),
             rx,
             result: Some(result),
-            operation,
         }
     }
 
@@ -416,7 +394,6 @@ impl ReadDirStream {
         if let Some(result) = self.result.take() {
             let _ = result.send(res);
         }
-        self.operation.take();
     }
 }
 
@@ -458,7 +435,7 @@ impl<D> StreamProducer<D> for ReadDirStream {
             // the stream is reported as dropped.
             Poll::Ready(None) => {
                 let result = match ready!(Pin::new(&mut self.task).poll(cx)) {
-                    Ok(result) => result.into_inner(),
+                    Ok(result) => result,
                     Err(err) => {
                         self.close(Err(ErrorCode::Io));
                         panic!("directory task should not panic: {err}")
@@ -490,7 +467,7 @@ struct WriteStreamConsumer {
     result: Option<oneshot::Sender<Result<(), ErrorCode>>>,
     operation: Option<FilesystemOperation>,
     buffer: BytesMut,
-    task: Option<JoinHandle<FilesystemOperationResult<std::io::Result<(BytesMut, usize)>>>>,
+    task: Option<JoinHandle<std::io::Result<(BytesMut, usize)>>>,
 }
 
 #[derive(Copy, Clone)]
@@ -616,18 +593,16 @@ impl<D> StreamConsumer<D> for WriteStreamConsumer {
             let buf = mem::take(&mut me.buffer);
             let file = Arc::clone(me.file.as_file());
             let location = me.location;
-            let operation = me.operation.clone();
+            let native = NativeOperation::new((file, buf), me.operation.clone());
             spawn_blocking(move || {
-                let operation = operation;
-                let file = file;
-                #[cfg(test)]
-                super::lifecycle_tests::native_work_gate(match location {
-                    WriteLocation::End => super::lifecycle_tests::NativeWorkSite::Append,
-                    WriteLocation::Offset(_) => super::lifecycle_tests::NativeWorkSite::Write,
-                });
-                let result = location.write(&file, &buf).map(|n| (buf, n));
-                drop(file);
-                FilesystemOperationResult::new(result, operation)
+                native.run(|(file, buf)| {
+                    #[cfg(test)]
+                    super::lifecycle_tests::native_work_gate(match location {
+                        WriteLocation::End => super::lifecycle_tests::NativeWorkSite::Append,
+                        WriteLocation::Offset(_) => super::lifecycle_tests::NativeWorkSite::Write,
+                    });
+                    location.write(file, buf).map(|n| (mem::take(buf), n))
+                })
             })
         });
         let result = match Pin::new(&mut *task).poll(cx) {
@@ -641,7 +616,7 @@ impl<D> StreamConsumer<D> for WriteStreamConsumer {
             other => ready!(other),
         };
         self.task = None;
-        match result.map(FilesystemOperationResult::into_inner) {
+        match result {
             Ok(Ok((buf, n))) => {
                 src.mark_read(n);
                 self.buffer = buf;
@@ -725,7 +700,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
                 return finish_stream_factory(&mut store, status, stream);
             }
         };
-        let operation = match start_operation(store.get().ctx) {
+        let operation = match file.start_operation().map_err(ErrorCode::from) {
             Ok(operation) => operation,
             Err(err) => {
                 let status =
@@ -763,7 +738,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
             }
         });
         let operation = match &file {
-            Ok(_) => start_operation(store.get().ctx).map_err(FilesystemError::from),
+            Ok(file) => file.start_operation().map_err(FilesystemError::from),
             Err(_) => Ok(None),
         };
         let (result_tx, result_rx) = oneshot::channel();
@@ -806,7 +781,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
             }
         });
         let operation = match &file {
-            Ok(_) => start_operation(store.get().ctx).map_err(FilesystemError::from),
+            Ok(file) => file.start_operation().map_err(FilesystemError::from),
             Err(_) => Ok(None),
         };
         let (result_tx, result_rx) = oneshot::channel();
@@ -844,9 +819,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         advice: Advice,
     ) -> FilesystemResult<()> {
         let file = store.get_file(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        file.advise(operation.clone(), offset, length, advice.into())
-            .await?;
+        file.advise(offset, length, advice.into()).await?;
         Ok(())
     }
 
@@ -855,8 +828,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<()> {
         let fd = store.get_descriptor(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        fd.sync_data(operation.clone()).await?;
+        fd.sync_data().await?;
         Ok(())
     }
 
@@ -865,8 +837,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<DescriptorFlags> {
         let fd = store.get_descriptor(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        let flags = fd.get_flags(operation.clone()).await?;
+        let flags = fd.get_flags().await?;
         Ok(flags.into())
     }
 
@@ -875,8 +846,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<DescriptorType> {
         let fd = store.get_descriptor(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        let ty = fd.get_type(operation.clone()).await?;
+        let ty = fd.get_type().await?;
         Ok(ty.into())
     }
 
@@ -886,8 +856,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         size: Filesize,
     ) -> FilesystemResult<()> {
         let file = store.get_file(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        file.set_size(operation.clone(), size).await?;
+        file.set_size(size).await?;
         Ok(())
     }
 
@@ -900,8 +869,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         let fd = store.get_descriptor(&fd)?;
         let atim = systemtimespec_from(data_access_timestamp)?;
         let mtim = systemtimespec_from(data_modification_timestamp)?;
-        let operation = start_accessor_operation(store)?;
-        fd.set_times(operation.clone(), atim, mtim).await?;
+        fd.set_times(atim, mtim).await?;
         Ok(())
     }
 
@@ -922,7 +890,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
                 return finish_stream_factory(&mut store, status, stream);
             }
         };
-        let operation = match start_operation(store.get().ctx) {
+        let operation = match dir.start_operation().map_err(ErrorCode::from) {
             Ok(operation) => operation,
             Err(err) => {
                 let status =
@@ -942,7 +910,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
             super::lifecycle_tests::native_work_gate(
                 super::lifecycle_tests::NativeWorkSite::ReadDirectory,
             );
-            let readdir = match dir.read_dir() {
+            let readdir = match cap_primitives::fs::read_base_dir(&dir) {
                 Ok(readdir) => readdir,
                 Err(err) => {
                     let err = ErrorCode::from(err);
@@ -979,8 +947,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
 
     async fn sync(store: &Accessor<U, Self>, fd: Resource<Descriptor>) -> FilesystemResult<()> {
         let fd = store.get_descriptor(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        fd.sync(operation.clone()).await?;
+        fd.sync().await?;
         Ok(())
     }
 
@@ -990,8 +957,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         path: String,
     ) -> FilesystemResult<()> {
         let dir = store.get_dir(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        dir.create_directory_at(operation.clone(), path).await?;
+        dir.create_directory_at(path).await?;
         Ok(())
     }
 
@@ -1000,8 +966,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<DescriptorStat> {
         let fd = store.get_descriptor(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        let stat = fd.stat(operation.clone()).await?;
+        let stat = fd.stat().await?;
         Ok(stat.into())
     }
 
@@ -1012,10 +977,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         path: String,
     ) -> FilesystemResult<DescriptorStat> {
         let dir = store.get_dir(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        let stat = dir
-            .stat_at(operation.clone(), path_flags.into(), path)
-            .await?;
+        let stat = dir.stat_at(path_flags.into(), path).await?;
         Ok(stat.into())
     }
 
@@ -1030,8 +992,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         let dir = store.get_dir(&fd)?;
         let atim = systemtimespec_from(data_access_timestamp)?;
         let mtim = systemtimespec_from(data_modification_timestamp)?;
-        let operation = start_accessor_operation(store)?;
-        dir.set_times_at(operation.clone(), path_flags.into(), path, atim, mtim)
+        dir.set_times_at(path_flags.into(), path, atim, mtim)
             .await?;
         Ok(())
     }
@@ -1045,15 +1006,8 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         new_path: String,
     ) -> FilesystemResult<()> {
         let (old_dir, new_dir) = store.get_dir_pair(&fd, &new_fd)?;
-        let operation = start_accessor_operation(store)?;
         old_dir
-            .link_at(
-                operation.clone(),
-                old_path_flags.into(),
-                old_path,
-                &new_dir,
-                new_path,
-            )
+            .link_at(old_path_flags.into(), old_path, &new_dir, new_path)
             .await?;
         Ok(())
     }
@@ -1066,19 +1020,13 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         open_flags: OpenFlags,
         flags: DescriptorFlags,
     ) -> FilesystemResult<Resource<Descriptor>> {
-        let (allow_blocking_current_thread, dir, operation) = store.with(|mut store| {
+        let (allow_blocking_current_thread, dir) = store.with(|mut store| {
             let store = store.get();
             let dir = get_dir(&store.table, &fd)?;
-            let operation = start_operation(store.ctx)?;
-            FilesystemResult::Ok((
-                store.ctx.allow_blocking_current_thread,
-                dir.clone(),
-                operation,
-            ))
+            FilesystemResult::Ok((store.ctx.allow_blocking_current_thread, dir.clone()))
         })?;
         let fd = dir
             .open_at(
-                operation.clone(),
                 path_flags.into(),
                 path,
                 open_flags.into(),
@@ -1086,7 +1034,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
                 allow_blocking_current_thread,
             )
             .await?;
-        let fd = store.with(|mut store| store.get().table.push(fd))?;
+        let fd = store.with(|mut store| fd.push(store.get().table))?;
         Ok(fd)
     }
 
@@ -1096,8 +1044,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         path: String,
     ) -> FilesystemResult<String> {
         let dir = store.get_dir(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        let path = dir.readlink_at(operation.clone(), path).await?;
+        let path = dir.readlink_at(path).await?;
         Ok(path)
     }
 
@@ -1107,8 +1054,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         path: String,
     ) -> FilesystemResult<()> {
         let dir = store.get_dir(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        dir.remove_directory_at(operation.clone(), path).await?;
+        dir.remove_directory_at(path).await?;
         Ok(())
     }
 
@@ -1120,10 +1066,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         new_path: String,
     ) -> FilesystemResult<()> {
         let (old_dir, new_dir) = store.get_dir_pair(&fd, &new_fd)?;
-        let operation = start_accessor_operation(store)?;
-        old_dir
-            .rename_at(operation.clone(), old_path, &new_dir, new_path)
-            .await?;
+        old_dir.rename_at(old_path, &new_dir, new_path).await?;
         Ok(())
     }
 
@@ -1134,9 +1077,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         new_path: String,
     ) -> FilesystemResult<()> {
         let dir = store.get_dir(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        dir.symlink_at(operation.clone(), old_path, new_path)
-            .await?;
+        dir.symlink_at(old_path, new_path).await?;
         Ok(())
     }
 
@@ -1146,8 +1087,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         path: String,
     ) -> FilesystemResult<()> {
         let dir = store.get_dir(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        dir.unlink_file_at(operation.clone(), path).await?;
+        dir.unlink_file_at(path).await?;
         Ok(())
     }
 
@@ -1156,15 +1096,14 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
         other: Resource<Descriptor>,
     ) -> wasmtime::Result<bool> {
-        let (fd, other, operation) = store.with(|mut store| {
+        let (fd, other) = store.with(|mut store| {
             let store = store.get();
             let table = store.table;
             let fd = get_descriptor(table, &fd)?.clone();
             let other = get_descriptor(table, &other)?.clone();
-            let operation = store.ctx.start_operation()?;
-            wasmtime::error::Ok((fd, other, operation))
+            wasmtime::error::Ok((fd, other))
         })?;
-        fd.is_same_object(operation.clone(), &other).await
+        fd.is_same_object(&other).await
     }
 
     async fn metadata_hash(
@@ -1172,8 +1111,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         fd: Resource<Descriptor>,
     ) -> FilesystemResult<MetadataHashValue> {
         let fd = store.get_descriptor(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        let meta = fd.metadata_hash(operation.clone()).await?;
+        let meta = fd.metadata_hash().await?;
         Ok(meta.into())
     }
 
@@ -1184,10 +1122,7 @@ impl<U> types::HostDescriptorWithStore<U> for WasiFilesystem {
         path: String,
     ) -> FilesystemResult<MetadataHashValue> {
         let dir = store.get_dir(&fd)?;
-        let operation = start_accessor_operation(store)?;
-        let meta = dir
-            .metadata_hash_at(operation.clone(), path_flags.into(), path)
-            .await?;
+        let meta = dir.metadata_hash_at(path_flags.into(), path).await?;
         Ok(meta.into())
     }
 }
@@ -1210,7 +1145,7 @@ impl preopens::Host for WasiFilesystemCtxView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::filesystem::{FsPerms, OpenMode};
+    use crate::filesystem::{FilesystemOperationError, FsPerms, OpenMode, WasiFilesystemCtx};
     use crate::p3::filesystem::lifecycle_tests::{InstalledGate, NativeWorkSite, TEST_LOCK};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
@@ -1247,36 +1182,124 @@ mod tests {
         }
     }
 
+    fn owned_file(content: Arc<AtomicUsize>, operation: Arc<AtomicUsize>) -> File {
+        let (content_tx, _) = mpsc::channel();
+        let content = Arc::new(CountDrop {
+            count: content,
+            dropped: content_tx,
+        });
+        let mut file = File::new(
+            tempfile::tempfile().unwrap(),
+            FsPerms::ReadWrite,
+            OpenMode::READ | OpenMode::WRITE,
+            false,
+        );
+        file.operation_hook = Some(Arc::new(move || {
+            let (dropped, _) = mpsc::channel();
+            Ok(FilesystemOperation::new((
+                content.clone(),
+                CountDrop {
+                    count: operation.clone(),
+                    dropped,
+                },
+            )))
+        }));
+        file
+    }
+
+    struct DrainDirectory(Option<oneshot::Sender<usize>>, usize);
+
+    impl StreamConsumer<TestCtx> for DrainDirectory {
+        type Item = DirectoryEntry;
+        fn poll_consume(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            mut store: StoreContextMut<TestCtx>,
+            mut source: Source<'_, Self::Item>,
+            _: bool,
+        ) -> Poll<wasmtime::Result<StreamResult>> {
+            let mut entries = Vec::with_capacity(source.remaining(&mut store));
+            source.read(&mut store, &mut entries)?;
+            self.1 += entries.len();
+            Poll::Ready(Ok(StreamResult::Completed))
+        }
+    }
+
+    impl Drop for DrainDirectory {
+        fn drop(&mut self) {
+            let _ = self.0.take().unwrap().send(self.1);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_p3_directory_iterator_retains_content_through_stream_lifetime() {
+        let _lock = TEST_LOCK.lock().await;
+        for consume in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(temp.path().join("child"), b"data").unwrap();
+            let content = Arc::new(AtomicUsize::new(0));
+            let admissions = Arc::new(AtomicUsize::new(0));
+            let file = owned_file(content.clone(), admissions.clone());
+            let native = cap_primitives::fs::open_ambient_dir(
+                temp.path(),
+                cap_primitives::ambient_authority(),
+            )
+            .unwrap();
+            let mut dir = Dir::new(native, FsPerms::ReadOnly, OpenMode::READ, true);
+            dir.operation_hook = file.operation_hook;
+            let mut table = ResourceTable::new();
+            let fd = table.push(Descriptor::Dir(dir)).unwrap();
+            let mut store = store(TestCtx {
+                filesystem: WasiFilesystemCtx::default(),
+                table,
+            });
+            let access = Access::<TestCtx, WasiFilesystem>::new(store.as_context_mut(), filesystem);
+            let (mut stream, mut status) = <WasiFilesystem as types::HostDescriptorWithStore<
+                TestCtx,
+            >>::read_directory(
+                access, Resource::new_borrow(fd.rep())
+            )
+            .unwrap();
+            store.data_mut().table.delete(fd).unwrap();
+            assert_eq!(content.load(Ordering::SeqCst), 0);
+            assert_eq!(admissions.load(Ordering::SeqCst), 0);
+            status.close(&mut store).unwrap();
+            if consume {
+                let (tx, rx) = oneshot::channel();
+                stream
+                    .pipe(&mut store, DrainDirectory(Some(tx), 0))
+                    .unwrap();
+                assert_eq!(
+                    store
+                        .run_concurrent(async |_| rx.await)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    1
+                );
+            } else {
+                stream.close(&mut store).unwrap();
+            }
+            assert_eq!(content.load(Ordering::SeqCst), 1);
+            assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        }
+    }
+
     #[test]
     fn terminal_read_releases_operation_but_retains_content() {
         for overflow in [false, true] {
             let content = Arc::new(AtomicUsize::new(0));
             let operation = Arc::new(AtomicUsize::new(0));
-            let (content_tx, _content_rx) = mpsc::channel();
-            let (operation_tx, _operation_rx) = mpsc::channel();
+            let file = owned_file(content.clone(), operation.clone());
+            let token = file.start_operation().unwrap();
             let (result_tx, mut result_rx) = oneshot::channel();
             let mut producer = ReadStreamProducer {
-                file: File::new(
-                    FilesystemHandle::new(
-                        tempfile::tempfile().unwrap(),
-                        CountDrop {
-                            count: content.clone(),
-                            dropped: content_tx,
-                        },
-                    ),
-                    FsPerms::ReadOnly,
-                    OpenMode::READ,
-                    false,
-                ),
+                file,
                 offset: u64::MAX,
                 result: Some(result_tx),
-                operation: Some(FilesystemOperation::new(CountDrop {
-                    count: operation.clone(),
-                    dropped: operation_tx,
-                })),
+                operation: token,
                 task: None,
             };
-
             if overflow {
                 assert!(matches!(producer.complete_read(1), StreamResult::Dropped));
                 assert!(matches!(result_rx.try_recv(), Ok(Err(ErrorCode::Overflow))));
@@ -1297,31 +1320,14 @@ mod tests {
         for append in [false, true] {
             let content = Arc::new(AtomicUsize::new(0));
             let operation = Arc::new(AtomicUsize::new(0));
-            let (content_tx, _content_rx) = mpsc::channel();
-            let (operation_tx, _operation_rx) = mpsc::channel();
+            let file = owned_file(content.clone(), operation.clone());
+            let token = file.start_operation().unwrap();
             let (result_tx, mut result_rx) = oneshot::channel();
-            let file = File::new(
-                FilesystemHandle::new(
-                    tempfile::tempfile().unwrap(),
-                    CountDrop {
-                        count: content.clone(),
-                        dropped: content_tx,
-                    },
-                ),
-                FsPerms::ReadWrite,
-                OpenMode::WRITE,
-                false,
-            );
-            let operation_owner = Some(FilesystemOperation::new(CountDrop {
-                count: operation.clone(),
-                dropped: operation_tx,
-            }));
             let mut consumer = if append {
-                WriteStreamConsumer::new_append(file, result_tx, operation_owner)
+                WriteStreamConsumer::new_append(file, result_tx, token)
             } else {
-                WriteStreamConsumer::new_at(file, 0, result_tx, operation_owner)
+                WriteStreamConsumer::new_at(file, 0, result_tx, token)
             };
-
             consumer.close(Ok(()));
             assert!(matches!(result_rx.try_recv(), Ok(Ok(()))));
             assert_eq!(operation.load(Ordering::SeqCst), 1);
@@ -1366,17 +1372,65 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_unpolled_directory_worker_releases_admission_and_content() {
+        let _lock = TEST_LOCK.lock().await;
+        let gate = InstalledGate::new(NativeWorkSite::ReadDirectory, 1);
+        let temp = tempfile::tempdir().unwrap();
+        let content = Arc::new(AtomicUsize::new(0));
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let (content_tx, content_rx) = mpsc::channel();
+        let (admission_tx, admission_rx) = mpsc::channel();
+        let owner = Arc::new(CountDrop {
+            count: content.clone(),
+            dropped: content_tx,
+        });
+        let native =
+            cap_primitives::fs::open_ambient_dir(temp.path(), cap_primitives::ambient_authority())
+                .unwrap();
+        let mut dir = Dir::new(native, FsPerms::ReadOnly, OpenMode::READ, false);
+        let admission_count = admissions.clone();
+        dir.operation_hook = Some(Arc::new(move || {
+            Ok(FilesystemOperation::new((
+                owner.clone(),
+                CountDrop {
+                    count: admission_count.clone(),
+                    dropped: admission_tx.clone(),
+                },
+            )))
+        }));
+        let operation = dir.start_operation().unwrap();
+        let (result_tx, _result_rx) = oneshot::channel();
+        let producer = ReadDirStream::new(dir.dir.clone(), result_tx, operation);
+        gate.wait_started();
+        drop(dir);
+        assert_eq!(content.load(Ordering::SeqCst), 0);
+        assert_eq!(admissions.load(Ordering::SeqCst), 0);
+        gate.release_one();
+        content_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        admission_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(content.load(Ordering::SeqCst), 1);
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+        assert!(producer.result.is_some(), "stream must remain unpolled");
+        drop(producer);
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn partial_factory_failures_close_status_and_retain_started_native_work() {
         let _lock = TEST_LOCK.lock().await;
         let gate = InstalledGate::new(NativeWorkSite::ReadDirectory, 1);
         let directory = tempfile::tempdir().unwrap();
-        let dir = Arc::new(FilesystemHandle::from(
+        let dir = Arc::new(
             cap_primitives::fs::open_ambient_dir(
                 directory.path(),
                 cap_primitives::ambient_authority(),
             )
             .unwrap(),
-        ));
+        );
         let count = Arc::new(AtomicUsize::new(0));
         let (dropped_tx, dropped_rx) = mpsc::channel();
         let operation = FilesystemOperation::new(CountDrop {
@@ -1473,7 +1527,9 @@ mod tests {
             }))
         });
         let mut table = ResourceTable::new();
-        let fd = table.push(descriptor).unwrap();
+        let fd = filesystem_ctx
+            .push_descriptor(&mut table, descriptor)
+            .unwrap();
         let mut store = store(TestCtx {
             filesystem: filesystem_ctx,
             table,
@@ -1498,9 +1554,9 @@ mod tests {
         let descriptor =
             Descriptor::File(File::new(file, FsPerms::ReadOnly, OpenMode::READ, false));
         let mut table = ResourceTable::new();
-        let fd = table.push(descriptor).unwrap();
         let mut filesystem = WasiFilesystemCtx::default();
         filesystem.set_operation_hook(|| Err(FilesystemOperationError::Rejected));
+        let fd = filesystem.push_descriptor(&mut table, descriptor).unwrap();
         let mut store = store(TestCtx { filesystem, table });
 
         let stat = store
@@ -1515,25 +1571,30 @@ mod tests {
             ErrorCode::Busy
         ));
 
-        let fd = store
-            .data_mut()
-            .table
-            .push(Descriptor::File(File::new(
-                tempfile::tempfile().unwrap(),
-                FsPerms::ReadOnly,
-                OpenMode::READ,
-                false,
-            )))
+        let ctx = store.data_mut();
+        let fd = ctx
+            .filesystem
+            .push_descriptor(
+                &mut ctx.table,
+                Descriptor::File(File::new(
+                    tempfile::tempfile().unwrap(),
+                    FsPerms::ReadOnly,
+                    OpenMode::READ,
+                    false,
+                )),
+            )
             .unwrap();
-        let other = store
-            .data_mut()
-            .table
-            .push(Descriptor::File(File::new(
-                tempfile::tempfile().unwrap(),
-                FsPerms::ReadOnly,
-                OpenMode::READ,
-                false,
-            )))
+        let other = ctx
+            .filesystem
+            .push_descriptor(
+                &mut ctx.table,
+                Descriptor::File(File::new(
+                    tempfile::tempfile().unwrap(),
+                    FsPerms::ReadOnly,
+                    OpenMode::READ,
+                    false,
+                )),
+            )
             .unwrap();
         let err = store
             .run_concurrent(async move |store| {

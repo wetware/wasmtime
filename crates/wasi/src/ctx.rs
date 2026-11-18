@@ -166,6 +166,9 @@ impl WasiCtxBuilder {
 
     /// Configures a hook which admits native filesystem operations.
     ///
+    /// See [`WasiFilesystemCtx::set_operation_hook`] for descriptor factory
+    /// retention and the explicit native-extraction ownership contract.
+    ///
     /// The returned [`FilesystemOperation`] is kept alive until all native
     /// work started by that operation has finished. Returning
     /// [`FilesystemOperationError::Rejected`] rejects the operation.

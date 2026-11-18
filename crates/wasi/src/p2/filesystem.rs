@@ -1,8 +1,6 @@
 use crate::TrappableError;
 use crate::filesystem::sys;
-use crate::filesystem::{
-    File, FilesystemOperation, FilesystemOperationError, FilesystemOperationHook,
-};
+use crate::filesystem::{File, FilesystemOperationError};
 use crate::p2::bindings::filesystem::types;
 use crate::p2::{InputStream, OutputStream, Pollable, StreamError, StreamResult};
 use crate::runtime::AbortOnDropJoinHandle;
@@ -78,7 +76,6 @@ pub struct FileInputStream {
     file: File,
     position: u64,
     state: ReadState,
-    operation_hook: Option<FilesystemOperationHook>,
 }
 enum ReadState {
     Idle,
@@ -93,22 +90,7 @@ impl FileInputStream {
             file: file.clone(),
             position,
             state: ReadState::Idle,
-            operation_hook: None,
         }
-    }
-
-    pub(crate) fn new_with_hook(
-        file: &File,
-        position: u64,
-        operation_hook: Option<FilesystemOperationHook>,
-    ) -> Self {
-        let mut stream = Self::new(file, position);
-        stream.operation_hook = operation_hook;
-        stream
-    }
-
-    fn start_operation(&self) -> Result<Option<FilesystemOperation>, FilesystemOperationError> {
-        self.operation_hook.as_ref().map(|hook| hook()).transpose()
     }
 
     fn blocking_read(file: &std::fs::File, offset: u64, size: usize) -> ReadState {
@@ -148,12 +130,10 @@ impl InputStream for FileInputStream {
                 }
 
                 let p = self.position;
-                let operation = self
-                    .start_operation()
-                    .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
                 self.state = ReadState::Waiting(
                     self.file
-                        .spawn_blocking(operation, move |f| Self::blocking_read(f, p, size)),
+                        .spawn_blocking(move |f| Self::blocking_read(f, p, size))
+                        .map_err(|e| StreamError::LastOperationFailed(e.into()))?,
                 );
                 Ok(Bytes::new())
             }
@@ -182,13 +162,11 @@ impl InputStream for FileInputStream {
         // Before we defer to the regular `read`, make sure it has data ready to go:
         if let ReadState::Idle = self.state {
             let p = self.position;
-            let operation = self
-                .start_operation()
-                .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
             self.state = self
                 .file
-                .run_blocking(operation, move |f| Self::blocking_read(f, p, size))
-                .await;
+                .run_blocking(move |f| Ok::<_, wasmtime::Error>(Self::blocking_read(f, p, size)))
+                .await
+                .map_err(StreamError::LastOperationFailed)?;
         }
 
         self.read(size)
@@ -221,16 +199,13 @@ impl Pollable for FileInputStream {
 
             const DEFAULT_READ_SIZE: usize = 4096;
             let p = self.position;
-            let operation = match self.start_operation() {
-                Ok(operation) => operation,
-                Err(error) => {
-                    self.state = ReadState::Error(error.into());
-                    return;
-                }
+            self.state = match self
+                .file
+                .spawn_blocking(move |f| Self::blocking_read(f, p, DEFAULT_READ_SIZE))
+            {
+                Ok(task) => ReadState::Waiting(task),
+                Err(error) => ReadState::Error(error.into()),
             };
-            self.state = ReadState::Waiting(self.file.spawn_blocking(operation, move |f| {
-                Self::blocking_read(f, p, DEFAULT_READ_SIZE)
-            }));
         }
 
         self.wait_ready().await
@@ -247,7 +222,6 @@ pub(crate) struct FileOutputStream {
     file: File,
     mode: FileOutputMode,
     state: OutputState,
-    operation_hook: Option<FilesystemOperationHook>,
 }
 
 enum OutputState {
@@ -266,18 +240,7 @@ impl FileOutputStream {
             file: file.clone(),
             mode: FileOutputMode::Position(position),
             state: OutputState::Ready,
-            operation_hook: None,
         }
-    }
-
-    pub(crate) fn write_at_with_hook(
-        file: &File,
-        position: u64,
-        operation_hook: Option<FilesystemOperationHook>,
-    ) -> Self {
-        let mut stream = Self::write_at(file, position);
-        stream.operation_hook = operation_hook;
-        stream
     }
 
     pub fn append(file: &File) -> Self {
@@ -285,21 +248,7 @@ impl FileOutputStream {
             file: file.clone(),
             mode: FileOutputMode::Append,
             state: OutputState::Ready,
-            operation_hook: None,
         }
-    }
-
-    pub(crate) fn append_with_hook(
-        file: &File,
-        operation_hook: Option<FilesystemOperationHook>,
-    ) -> Self {
-        let mut stream = Self::append(file);
-        stream.operation_hook = operation_hook;
-        stream
-    }
-
-    fn start_operation(&self) -> Result<Option<FilesystemOperation>, FilesystemOperationError> {
-        self.operation_hook.as_ref().map(|hook| hook()).transpose()
     }
 
     fn blocking_write(
@@ -356,12 +305,10 @@ impl OutputStream for FileOutputStream {
         }
 
         let m = self.mode;
-        let operation = self
-            .start_operation()
-            .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
         self.state = OutputState::Waiting(
             self.file
-                .spawn_blocking(operation, move |f| Self::blocking_write(f, buf, m)),
+                .spawn_blocking(move |f| Self::blocking_write(f, buf, m))
+                .map_err(|e| StreamError::LastOperationFailed(e.into()))?,
         );
         Ok(())
     }
@@ -382,11 +329,12 @@ impl OutputStream for FileOutputStream {
 
         let m = self.mode;
         let operation = self
+            .file
             .start_operation()
             .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
         match self
             .file
-            .run_blocking(operation, move |f| Self::blocking_write(f, buf, m))
+            .run_blocking_with(operation, move |f| Self::blocking_write(f, buf, m))
             .await
         {
             Ok(nwritten) => {
@@ -490,7 +438,7 @@ impl IntoIterator for ReaddirIterator {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use crate::filesystem::{FsPerms, OpenMode};
+    use crate::filesystem::{FilesystemOperation, FilesystemOperationHook, FsPerms, OpenMode};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -547,9 +495,10 @@ mod lifecycle_tests {
     #[test]
     fn completed_unpolled_read_releases_operation() {
         for contents in [b"data".as_slice(), b"".as_slice()] {
-            let (_path, file) = file(contents);
+            let (_path, mut file) = file(contents);
             let drops = Arc::new(AtomicUsize::new(0));
-            let mut stream = FileInputStream::new_with_hook(&file, 0, hook(&drops));
+            file.operation_hook = hook(&drops);
+            let mut stream = FileInputStream::new(&file, 0);
             let owners = Arc::strong_count(&file.file);
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .build()
@@ -575,12 +524,13 @@ mod lifecycle_tests {
     }
 
     fn check_completed_unpolled_write(append: bool) {
-        let (_path, file) = file(b"head");
+        let (_path, mut file) = file(b"head");
         let drops = Arc::new(AtomicUsize::new(0));
+        file.operation_hook = hook(&drops);
         let mut stream = if append {
-            FileOutputStream::append_with_hook(&file, hook(&drops))
+            FileOutputStream::append(&file)
         } else {
-            FileOutputStream::write_at_with_hook(&file, 0, hook(&drops))
+            FileOutputStream::write_at(&file, 0)
         };
         let owners = Arc::strong_count(&file.file);
         let runtime = tokio::runtime::Builder::new_current_thread()

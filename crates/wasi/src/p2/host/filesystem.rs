@@ -65,7 +65,7 @@ impl WasiFilesystemCtxView<'_> {
         }
 
         let entries = d
-            .run_blocking(operation, |d| {
+            .run_blocking_with(operation, |d| {
                 // Both `entries` and `metadata` perform syscalls, which is why they are done
                 // within this `block` call, rather than delay calculating the metadata
                 // for entries when they're demanded later in the iterator chain.
@@ -119,15 +119,13 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         advice: types::Advice,
     ) -> FsResult<()> {
         let f = self.table.get(&fd)?.file()?;
-        let operation = self.ctx.start_operation()?;
-        f.advise(operation, offset, len, advice.into()).await?;
+        f.advise(offset, len, advice.into()).await?;
         Ok(())
     }
 
     async fn sync_data(&mut self, fd: Resource<types::Descriptor>) -> FsResult<()> {
         let descriptor = self.table.get(&fd)?;
-        let operation = self.ctx.start_operation()?;
-        descriptor.sync_data(operation).await?;
+        descriptor.sync_data().await?;
         Ok(())
     }
 
@@ -136,8 +134,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         fd: Resource<types::Descriptor>,
     ) -> FsResult<types::DescriptorFlags> {
         let descriptor = self.table.get(&fd)?;
-        let operation = self.ctx.start_operation()?;
-        let flags = descriptor.get_flags(operation).await?;
+        let flags = descriptor.get_flags().await?;
         Ok(flags.into())
     }
 
@@ -146,8 +143,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         fd: Resource<types::Descriptor>,
     ) -> FsResult<types::DescriptorType> {
         let descriptor = self.table.get(&fd)?;
-        let operation = self.ctx.start_operation()?;
-        let ty = descriptor.get_type(operation).await?;
+        let ty = descriptor.get_type().await?;
         Ok(ty.into())
     }
 
@@ -157,8 +153,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         size: types::Filesize,
     ) -> FsResult<()> {
         let f = self.table.get(&fd)?.file()?;
-        let operation = self.ctx.start_operation()?;
-        f.set_size(operation, size).await?;
+        f.set_size(size).await?;
         Ok(())
     }
 
@@ -171,8 +166,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         let descriptor = self.table.get(&fd)?;
         let atim = systemtimespec_from(atim)?;
         let mtim = systemtimespec_from(mtim)?;
-        let operation = self.ctx.start_operation()?;
-        descriptor.set_times(operation, atim, mtim).await?;
+        descriptor.set_times(atim, mtim).await?;
         Ok(())
     }
 
@@ -183,10 +177,9 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         offset: types::Filesize,
     ) -> FsResult<(Vec<u8>, bool)> {
         let f = self.table.get(&fd)?.file()?;
-        let operation = self.ctx.start_operation()?;
 
         let (mut buffer, r) = f
-            .run_blocking(operation, move |f| {
+            .run_blocking(move |f| {
                 let mut buffer = vec![
                     0;
                     len.try_into()
@@ -194,9 +187,9 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
                         .min(crate::MAX_READ_SIZE_ALLOC)
                 ];
                 let r = sys::read_at_cursor_unspecified(f, &mut buffer, offset);
-                (buffer, r)
+                Ok::<_, std::io::Error>((buffer, r))
             })
-            .await;
+            .await?;
 
         let (bytes_read, state) = match r? {
             0 => (0, true),
@@ -218,12 +211,9 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         if f.perms.write_not_permitted() {
             return Err(ErrorCode::NotPermitted.into());
         }
-        let operation = self.ctx.start_operation()?;
 
         let bytes_written = f
-            .run_blocking(operation, move |f| {
-                sys::write_at_cursor_unspecified(f, &buf, offset)
-            })
+            .run_blocking(move |f| sys::write_at_cursor_unspecified(f, &buf, offset))
             .await?;
 
         Ok(types::Filesize::try_from(bytes_written).expect("usize fits in Filesize"))
@@ -233,15 +223,13 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         &mut self,
         fd: Resource<types::Descriptor>,
     ) -> FsResult<Resource<types::DirectoryEntryStream>> {
-        self.table.get(&fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
+        let operation = self.table.get(&fd)?.dir()?.start_operation()?;
         self.read_directory_with_operation(fd, operation).await
     }
 
     async fn sync(&mut self, fd: Resource<types::Descriptor>) -> FsResult<()> {
         let descriptor = self.table.get(&fd)?;
-        let operation = self.ctx.start_operation()?;
-        descriptor.sync(operation).await?;
+        descriptor.sync().await?;
         Ok(())
     }
 
@@ -251,15 +239,13 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<()> {
         let d = self.table.get(&fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
-        d.create_directory_at(operation, path).await?;
+        d.create_directory_at(path).await?;
         Ok(())
     }
 
     async fn stat(&mut self, fd: Resource<types::Descriptor>) -> FsResult<types::DescriptorStat> {
         let descriptor = self.table.get(&fd)?;
-        let operation = self.ctx.start_operation()?;
-        let stat = descriptor.stat(operation).await?;
+        let stat = descriptor.stat().await?;
         Ok(stat.try_into()?)
     }
 
@@ -270,8 +256,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<types::DescriptorStat> {
         let d = self.table.get(&fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
-        let stat = d.stat_at(operation, path_flags.into(), path).await?;
+        let stat = d.stat_at(path_flags.into(), path).await?;
         Ok(stat.try_into()?)
     }
 
@@ -286,9 +271,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         let d = self.table.get(&fd)?.dir()?;
         let atim = systemtimespec_from(atim)?;
         let mtim = systemtimespec_from(mtim)?;
-        let operation = self.ctx.start_operation()?;
-        d.set_times_at(operation, path_flags.into(), path, atim, mtim)
-            .await?;
+        d.set_times_at(path_flags.into(), path, atim, mtim).await?;
         Ok(())
     }
 
@@ -303,15 +286,8 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
     ) -> FsResult<()> {
         let old_dir = self.table.get(&fd)?.dir()?;
         let new_dir = self.table.get(&new_descriptor)?.dir()?;
-        let operation = self.ctx.start_operation()?;
         old_dir
-            .link_at(
-                operation,
-                old_path_flags.into(),
-                old_path,
-                new_dir,
-                new_path,
-            )
+            .link_at(old_path_flags.into(), old_path, new_dir, new_path)
             .await?;
         Ok(())
     }
@@ -325,10 +301,8 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         flags: types::DescriptorFlags,
     ) -> FsResult<Resource<types::Descriptor>> {
         let d = self.table.get(&fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
         let fd = d
             .open_at(
-                operation.clone(),
                 path_flags.into(),
                 path,
                 oflags.into(),
@@ -336,7 +310,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
                 self.ctx.allow_blocking_current_thread,
             )
             .await?;
-        let fd = self.table.push(fd)?;
+        let fd = fd.push(self.table)?;
         Ok(fd)
     }
 
@@ -357,8 +331,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<String> {
         let d = self.table.get(&fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
-        let path = d.readlink_at(operation, path).await?;
+        let path = d.readlink_at(path).await?;
         Ok(path)
     }
 
@@ -368,8 +341,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<()> {
         let d = self.table.get(&fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
-        d.remove_directory_at(operation, path).await?;
+        d.remove_directory_at(path).await?;
         Ok(())
     }
 
@@ -382,10 +354,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
     ) -> FsResult<()> {
         let old_dir = self.table.get(&fd)?.dir()?;
         let new_dir = self.table.get(&new_fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
-        old_dir
-            .rename_at(operation, old_path, new_dir, new_path)
-            .await?;
+        old_dir.rename_at(old_path, new_dir, new_path).await?;
         Ok(())
     }
 
@@ -396,8 +365,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         dest_path: String,
     ) -> FsResult<()> {
         let d = self.table.get(&fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
-        d.symlink_at(operation, src_path, dest_path).await?;
+        d.symlink_at(src_path, dest_path).await?;
         Ok(())
     }
 
@@ -407,8 +375,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<()> {
         let d = self.table.get(&fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
-        d.unlink_file_at(operation, path).await?;
+        d.unlink_file_at(path).await?;
         Ok(())
     }
 
@@ -423,11 +390,9 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
             Descriptor::File(f) => f,
             Descriptor::Dir(_) => return Err(ErrorCode::IsDirectory.into()),
         };
-        let operation_hook = self.ctx.operation_hook();
 
         // Create a stream view for it.
-        let reader: DynInputStream =
-            Box::new(FileInputStream::new_with_hook(f, offset, operation_hook));
+        let reader: DynInputStream = Box::new(FileInputStream::new(f, offset));
 
         // Insert the stream view into the table. Trap if the table is full.
         let index = self.table.push(reader)?;
@@ -446,10 +411,9 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         if f.perms.write_not_permitted() {
             Err(types::ErrorCode::NotPermitted)?;
         }
-        let operation_hook = self.ctx.operation_hook();
 
         // Create a stream view for it.
-        let writer = FileOutputStream::write_at_with_hook(f, offset, operation_hook);
+        let writer = FileOutputStream::write_at(f, offset);
         let writer: DynOutputStream = Box::new(writer);
 
         // Insert the stream view into the table. Trap if the table is full.
@@ -468,10 +432,9 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         if f.perms.write_not_permitted() {
             Err(types::ErrorCode::NotPermitted)?;
         }
-        let operation_hook = self.ctx.operation_hook();
 
         // Create a stream view for it.
-        let appender = FileOutputStream::append_with_hook(f, operation_hook);
+        let appender = FileOutputStream::append(f);
         let appender: DynOutputStream = Box::new(appender);
 
         // Insert the stream view into the table. Trap if the table is full.
@@ -487,16 +450,14 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
     ) -> wasmtime::Result<bool> {
         let descriptor_a = self.table.get(&a)?;
         let descriptor_b = self.table.get(&b)?;
-        let operation = self.ctx.start_operation().map_err(wasmtime::Error::new)?;
-        descriptor_a.is_same_object(operation, descriptor_b).await
+        descriptor_a.is_same_object(descriptor_b).await
     }
     async fn metadata_hash(
         &mut self,
         fd: Resource<types::Descriptor>,
     ) -> FsResult<types::MetadataHashValue> {
         let fd = self.table.get(&fd)?;
-        let operation = self.ctx.start_operation()?;
-        let meta = fd.metadata_hash(operation).await?;
+        let meta = fd.metadata_hash().await?;
         Ok(meta.into())
     }
     async fn metadata_hash_at(
@@ -506,10 +467,7 @@ impl HostDescriptor for WasiFilesystemCtxView<'_> {
         path: String,
     ) -> FsResult<types::MetadataHashValue> {
         let d = self.table.get(&fd)?.dir()?;
-        let operation = self.ctx.start_operation()?;
-        let meta = d
-            .metadata_hash_at(operation, path_flags.into(), path)
-            .await?;
+        let meta = d.metadata_hash_at(path_flags.into(), path).await?;
         Ok(meta.into())
     }
 }
@@ -750,6 +708,12 @@ impl From<std::io::Error> for ErrorCode {
 
 impl<'a> From<&'a std::io::Error> for ErrorCode {
     fn from(err: &'a std::io::Error) -> ErrorCode {
+        if err
+            .get_ref()
+            .is_some_and(|error| error.is::<crate::filesystem::FilesystemOperationError>())
+        {
+            return ErrorCode::WouldBlock;
+        }
         match from_raw_os_error(err.raw_os_error()) {
             Some(errno) => errno,
             None => {
@@ -877,7 +841,9 @@ mod test {
         ctx.set_operation_hook(|| Err(FilesystemOperationError::Rejected));
         let (_path, file) = file_with_contents(b"contents");
         let mut table = ResourceTable::new();
-        let file = table.push(Descriptor::File(file)).unwrap();
+        let file = ctx
+            .push_descriptor(&mut table, Descriptor::File(file))
+            .unwrap();
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,
             table: &mut table,
@@ -895,7 +861,9 @@ mod test {
         ctx.set_operation_hook(|| Err(FilesystemOperationError::Rejected));
         let (_path, file) = file_with_contents(b"contents");
         let mut table = ResourceTable::new();
-        let file = table.push(Descriptor::File(file)).unwrap();
+        let file = ctx
+            .push_descriptor(&mut table, Descriptor::File(file))
+            .unwrap();
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,
             table: &mut table,
@@ -920,7 +888,9 @@ mod test {
         let mut ctx = WasiFilesystemCtx::default();
         counting_hook(&mut ctx, admissions.clone(), drops.clone());
         let mut table = ResourceTable::new();
-        let directory = table.push(Descriptor::Dir(dir(tempdir.path()))).unwrap();
+        let directory = ctx
+            .push_descriptor(&mut table, Descriptor::Dir(dir(tempdir.path())))
+            .unwrap();
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,
             table: &mut table,
@@ -964,7 +934,9 @@ mod test {
         counting_hook(&mut ctx, admissions.clone(), drops.clone());
         let (_path, file) = file_with_contents(b"ab");
         let mut table = ResourceTable::new();
-        let file = table.push(Descriptor::File(file)).unwrap();
+        let file = ctx
+            .push_descriptor(&mut table, Descriptor::File(file))
+            .unwrap();
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,
             table: &mut table,
@@ -1003,7 +975,9 @@ mod test {
         counting_hook(&mut ctx, admissions.clone(), drops.clone());
         let (_path, file) = file_with_contents(b"");
         let mut table = ResourceTable::new();
-        let file = table.push(Descriptor::File(file)).unwrap();
+        let file = ctx
+            .push_descriptor(&mut table, Descriptor::File(file))
+            .unwrap();
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,
             table: &mut table,
@@ -1049,7 +1023,9 @@ mod test {
         let mut ctx = WasiFilesystemCtx::default();
         counting_hook(&mut ctx, admissions.clone(), drops.clone());
         let mut table = ResourceTable::new();
-        let directory = table.push(Descriptor::Dir(dir(tempdir.path()))).unwrap();
+        let directory = ctx
+            .push_descriptor(&mut table, Descriptor::Dir(dir(tempdir.path())))
+            .unwrap();
         table.set_max_capacity(1);
         let mut view = WasiFilesystemCtxView {
             ctx: &mut ctx,

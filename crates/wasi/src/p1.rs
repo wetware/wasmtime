@@ -652,7 +652,7 @@ impl WasiP1Ctx {
                 let append = *append;
                 drop(t);
                 let f = self.table.get(&fd)?.file()?;
-                let operation = self.wasi.filesystem.start_operation()?;
+                let operation = f.start_operation()?;
 
                 let do_write = move |f: &std::fs::File, buf: &[u8]| match (append, write) {
                     // Note that this is implementing Linux semantics of
@@ -672,7 +672,7 @@ impl WasiP1Ctx {
                     // block.
                     None => {
                         let buf = memory.to_vec(buf)?;
-                        f.run_blocking(operation.clone(), move |f| do_write(f, &buf))
+                        f.run_blocking_with(operation.clone(), move |f| do_write(f, &buf))
                             .await
                     }
                 };
@@ -688,7 +688,7 @@ impl WasiP1Ctx {
                         // cursor. Both syscalls are one P1 operation and share
                         // the admission acquired above.
                         let len = f
-                            .run_blocking(operation, sys::stat)
+                            .run_blocking_with(operation, sys::stat)
                             .await
                             .map_err(crate::filesystem::ErrorCode::from)?;
                         position.store(len.size, Ordering::Relaxed);
@@ -1497,12 +1497,15 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             }) => (fd.borrowed(), *blocking_mode, *append),
         };
         let descriptor = self.table.get(&fd)?;
-        let operation = self.wasi.filesystem.start_operation()?;
-        let flags: filesystem::DescriptorFlags =
-            descriptor.get_flags(operation.clone()).await?.into();
-        let fs_filetype = filesystem::DescriptorType::from(descriptor.get_type(operation).await?)
-            .try_into()
-            .map_err(types::Error::trap)?;
+        let operation = descriptor.start_operation()?;
+        let flags: filesystem::DescriptorFlags = descriptor
+            .get_flags_with_operation(operation.clone())
+            .await?
+            .into();
+        let fs_filetype =
+            filesystem::DescriptorType::from(descriptor.get_type_with_operation(operation).await?)
+                .try_into()
+                .map_err(types::Error::trap)?;
         let mut fs_flags = types::Fdflags::empty();
         let mut fs_rights_base = types::Rights::all();
         if let types::Filetype::Directory = fs_filetype {
@@ -1607,7 +1610,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                 let fd = fd.borrowed();
                 drop(t);
                 let descriptor = self.table.get(&fd)?;
-                let operation = self.wasi.filesystem.start_operation()?;
+                let operation = descriptor.start_operation()?;
                 let filesystem::DescriptorStat {
                     type_,
                     link_count: nlink,
@@ -1616,11 +1619,11 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                     data_modification_timestamp,
                     status_change_timestamp,
                 } = descriptor
-                    .stat(operation.clone())
+                    .stat_with_operation(operation.clone())
                     .await?
                     .try_into()
                     .map_err(FsError::from)?;
-                let metadata_hash = descriptor.metadata_hash(operation).await?;
+                let metadata_hash = descriptor.metadata_hash_with_operation(operation).await?;
                 let filetype = type_.try_into().map_err(types::Error::trap)?;
                 let zero = wall_clock::Datetime {
                     seconds: 0,
@@ -1710,7 +1713,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                 drop(t);
                 let pos = position.load(Ordering::Relaxed);
                 let file = self.table.get(&fd)?.file()?;
-                let operation = self.wasi.filesystem.start_operation()?;
+                let operation = file.start_operation()?;
                 let bytes_read = match (file.as_blocking_file(), memory.as_slice_mut(iov)?) {
                     // Try to read directly into wasm memory where possible
                     // when the current thread can block and additionally wasm
@@ -1727,7 +1730,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
                         drop(buf);
                         let mut buf = vec![0; iov.len() as usize];
                         let buf = file
-                            .run_blocking(operation, move |file| -> Result<_, types::Error> {
+                            .run_blocking_with(operation, move |file| -> Result<_, types::Error> {
                                 let bytes_read =
                                     sys::read_at_cursor_unspecified(file, &mut buf, pos)
                                         .map_err(|e| StreamError::LastOperationFailed(e.into()))?;
@@ -1981,14 +1984,16 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         cookie: types::Dircookie,
     ) -> Result<types::Size, types::Error> {
         let fd = self.get_dir_fd(fd)?;
-        let operation = self.wasi.filesystem.start_operation()?;
+        let operation = self.table.get(&fd)?.start_operation()?;
         let stream = self
             .filesystem()
             .read_directory_with_operation(fd.borrowed(), operation.clone())
             .await?;
         let descriptor = self.table.get(&fd)?.clone();
         let d = descriptor.dir()?;
-        let dir_metadata_hash = descriptor.metadata_hash(operation.clone()).await?;
+        let dir_metadata_hash = descriptor
+            .metadata_hash_with_operation(operation.clone())
+            .await?;
         let cookie = cookie.try_into().map_err(|_| types::Errno::Overflow)?;
 
         let head = [
@@ -2022,7 +2027,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         {
             let filesystem::DirectoryEntry { type_, name } = entry?;
             let metadata_hash = d
-                .metadata_hash_at(
+                .metadata_hash_at_with_operation(
                     operation.clone(),
                     crate::filesystem::PathFlags::empty(),
                     name.clone(),
@@ -2107,7 +2112,7 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
         let dirfd = self.get_dir_fd(dirfd)?;
         let path = self.read_string(memory, path)?;
         let d = self.table.get(&dirfd)?.dir()?;
-        let operation = self.wasi.filesystem.start_operation()?;
+        let operation = d.start_operation()?;
         let path_flags = filesystem::PathFlags::from(flags).into();
         let filesystem::DescriptorStat {
             type_,
@@ -2117,11 +2122,13 @@ impl wasi_snapshot_preview1::WasiSnapshotPreview1 for WasiP1Ctx {
             data_modification_timestamp,
             status_change_timestamp,
         } = d
-            .stat_at(operation.clone(), path_flags, path.clone())
+            .stat_at_with_operation(operation.clone(), path_flags, path.clone())
             .await?
             .try_into()
             .map_err(FsError::from)?;
-        let metadata_hash = d.metadata_hash_at(operation, path_flags, path).await?;
+        let metadata_hash = d
+            .metadata_hash_at_with_operation(operation, path_flags, path)
+            .await?;
         let filetype = type_.try_into().map_err(types::Error::trap)?;
         let zero = wall_clock::Datetime {
             seconds: 0,
@@ -2819,8 +2826,19 @@ mod lifecycle_tests {
     async fn fd_pread_rejection_is_again() -> wasmtime::Result<()> {
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("file"), b"data")?;
+        let reject = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut builder = crate::WasiCtxBuilder::new();
         builder.preopened_dir(directory.path(), ".", crate::FsPerms::ReadWrite)?;
+        builder.filesystem_operation_hook({
+            let reject = reject.clone();
+            move || {
+                if reject.load(Ordering::SeqCst) {
+                    Err(FilesystemOperationError::Rejected)
+                } else {
+                    Ok(FilesystemOperation::new(()))
+                }
+            }
+        });
         let mut ctx = builder.build_p1();
         ctx.table.set_max_capacity(1000);
         ctx.hostcall_fuel = usize::MAX;
@@ -2840,9 +2858,7 @@ mod lifecycle_tests {
             )
             .await?;
 
-        ctx.wasi
-            .filesystem
-            .set_operation_hook(|| Err(FilesystemOperationError::Rejected));
+        reject.store(true, Ordering::SeqCst);
         let iov = GuestPtr::<types::Iovec>::new(8);
         memory.write(
             iov,

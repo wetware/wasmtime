@@ -1,18 +1,24 @@
+#[cfg(feature = "p2")]
 use crate::filesystem::FilesystemOperation;
+#[cfg(feature = "p2")]
 use crate::p3::bindings::Command;
+#[cfg(feature = "p2")]
 use crate::{FsPerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+#[cfg(feature = "p2")]
 use futures::FutureExt as _;
+#[cfg(feature = "p2")]
 use std::path::Path;
-use std::sync::{
-    Arc, Condvar, Mutex,
-    atomic::{AtomicUsize, Ordering},
-    mpsc,
-};
+#[cfg(feature = "p2")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+#[cfg(feature = "p2")]
 use test_programs_artifacts::{
     P3_API_FILESYSTEM_LIFECYCLE_COMPONENT, P3_FILE_WRITE_CHUNKED_COMPONENT,
     P3_FILE_WRITE_COMPONENT, P3_READDIR_COMPONENT,
 };
+#[cfg(feature = "p2")]
 use wasmtime::component::{Component, Linker, ResourceTable};
+#[cfg(feature = "p2")]
 use wasmtime::{Store, error::Context as _};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,11 +129,13 @@ impl Drop for InstalledGate {
     }
 }
 
+#[cfg(feature = "p2")]
 struct TestCtx {
     wasi: WasiCtx,
     table: ResourceTable,
 }
 
+#[cfg(feature = "p2")]
 impl WasiView for TestCtx {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
@@ -137,12 +145,14 @@ impl WasiView for TestCtx {
     }
 }
 
+#[cfg(feature = "p2")]
 struct CountActive {
     active: Arc<AtomicUsize>,
     drop_count: Arc<AtomicUsize>,
     dropped: mpsc::Sender<()>,
 }
 
+#[cfg(feature = "p2")]
 impl Drop for CountActive {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::SeqCst);
@@ -151,6 +161,7 @@ impl Drop for CountActive {
     }
 }
 
+#[cfg(feature = "p2")]
 async fn run_component(
     component_path: &'static str,
     scenario: Option<&'static str>,
@@ -232,6 +243,7 @@ async fn run_component(
     }
 }
 
+#[cfg(feature = "p2")]
 fn wait_until_inactive(active: &AtomicUsize, dropped: &mpsc::Receiver<()>) {
     while active.load(Ordering::SeqCst) != 0 {
         dropped
@@ -240,6 +252,7 @@ fn wait_until_inactive(active: &AtomicUsize, dropped: &mpsc::Receiver<()>) {
     }
 }
 
+#[cfg(feature = "p2")]
 async fn check_store_drop_during_native_work(
     component: &'static str,
     scenario: Option<&'static str>,
@@ -291,6 +304,7 @@ async fn check_store_drop_during_native_work(
     );
 }
 
+#[cfg(feature = "p2")]
 async fn check_terminal_stream_release(
     scenario: &'static str,
     gated_hits: usize,
@@ -343,6 +357,7 @@ async fn check_terminal_stream_release(
     assert!(task.await.unwrap_err().is_cancelled());
 }
 
+#[cfg(feature = "p2")]
 async fn check_native_panic_releases_session(
     component: &'static str,
     site: NativeWorkSite,
@@ -387,6 +402,7 @@ async fn check_native_panic_releases_session(
 
 pub(super) static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_session_survives_store_drop_and_reuses_admission_across_chunks() {
     let _lock = TEST_LOCK.lock().await;
@@ -394,6 +410,7 @@ async fn read_session_survives_store_drop_and_reuses_admission_across_chunks() {
         .await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_session_survives_store_drop_and_reuses_admission_across_chunks() {
     let _lock = TEST_LOCK.lock().await;
@@ -406,6 +423,7 @@ async fn write_session_survives_store_drop_and_reuses_admission_across_chunks() 
     .await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_session_survives_store_drop_while_native_work_runs() {
     let _lock = TEST_LOCK.lock().await;
@@ -418,6 +436,7 @@ async fn append_session_survives_store_drop_while_native_work_runs() {
     .await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn eager_readdir_survives_store_drop_while_native_work_runs() {
     let _lock = TEST_LOCK.lock().await;
@@ -430,30 +449,35 @@ async fn eager_readdir_survives_store_drop_while_native_work_runs() {
     .await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_close_does_not_end_session_and_eof_releases_inert_stream() {
     let _lock = TEST_LOCK.lock().await;
     check_terminal_stream_release("eof", 3, false).await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_error_releases_inert_stream() {
     let _lock = TEST_LOCK.lock().await;
     check_terminal_stream_release("error", 1, false).await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_mode_terminal_eof_releases_inert_stream() {
     let _lock = TEST_LOCK.lock().await;
     check_terminal_stream_release("eof", 3, true).await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_native_panic_releases_session_while_store_remains_alive() {
     let _lock = TEST_LOCK.lock().await;
     check_native_panic_releases_session(P3_FILE_WRITE_COMPONENT, NativeWorkSite::Read, false).await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_native_panic_releases_session_while_store_remains_alive() {
     let _lock = TEST_LOCK.lock().await;
@@ -461,6 +485,7 @@ async fn write_native_panic_releases_session_while_store_remains_alive() {
         .await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readdir_native_panic_releases_session_while_store_remains_alive() {
     let _lock = TEST_LOCK.lock().await;
@@ -468,6 +493,7 @@ async fn readdir_native_panic_releases_session_while_store_remains_alive() {
         .await;
 }
 
+#[cfg(feature = "p2")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_native_panic_releases_session_while_store_remains_alive() {
     let _lock = TEST_LOCK.lock().await;
